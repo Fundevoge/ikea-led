@@ -28,6 +28,7 @@ use esp32s3_hal::{
     gdma::*,
     peripherals::Peripherals,
     prelude::*,
+    rng,
     rtc_cntl::RtcClock,
     spi::{
         master::{prelude::*, Spi},
@@ -148,7 +149,7 @@ async fn render_loop(
         false,
         &mut descriptors,
         &mut rx_descriptors,
-        DmaPriority::Priority0,
+        DmaPriority::Priority9,
     ));
 
     loop {
@@ -306,7 +307,7 @@ async fn main(spawner: embassy_executor::Spawner) -> ! {
     let dma = Gdma::new(peripherals.DMA);
     let dma_channel: ChannelCreator0 = dma.channel0;
 
-    let spi = Spi::new(peripherals.SPI2, 12u32.MHz(), SpiMode::Mode0, &clocks).with_pins(
+    let spi = Spi::new(peripherals.SPI2, 4u32.MHz(), SpiMode::Mode0, &clocks).with_pins(
         Some(sclk),
         Some(mosi),
         Some(miso),
@@ -340,9 +341,8 @@ async fn main(spawner: embassy_executor::Spawner) -> ! {
         dns_servers,
     });
 
-    let seed = 1234; // very random, very secure seed
+    let seed = 666722646956068949;
 
-    // Init network stack
     let wifi_program_stack = &*static_cell::make_static!(embassy_net::Stack::new(
         wifi_interface,
         config,
