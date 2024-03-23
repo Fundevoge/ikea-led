@@ -8,6 +8,9 @@ edition = "2021"
 [profile.release]
 opt-level = 3
 
+[profile.dev.package.esp-wifi]
+opt-level = 3
+
 [dependencies]
 esp32s3-hal = { version = "0.15.0", features = [
     "async",
@@ -37,14 +40,14 @@ esp-wifi = { version = "0.3.0", features = [
 ], default-features = false }
 
 embassy-time = { version = "0.3.0", features = ["generic-queue-8"] }
-embassy-executor = { version = "0.5.0", features = ["task-arena-size-32768"] }
+embassy-executor = { version = "0.5.0", features = ["task-arena-size-65536"] }
 embassy-sync = "0.5.0"
 embassy-net = { version = "0.4.0", features = [
+    "medium-ethernet",
+    "medium-ip",
     "proto-ipv4",
     "tcp",
-    "medium-ip",
     "udp",
-    "medium-ethernet",
 ] }
 
 embedded-hal = "1.0.0"
@@ -59,3 +62,4 @@ smoltcp = { version = "0.11.0", features = [
 ], default-features = false }
 heapless = "0.8.0"
 chrono = { version = "0.4.31", default-features = false }
+byteorder = { version = "1.5.0", default-features = false }

@@ -2,23 +2,17 @@
 #![no_main]
 #![feature(type_alias_impl_trait)]
 #![feature(const_mut_refs)]
+#![feature(const_slice_from_raw_parts_mut)]
+
+mod patterns;
+mod tz_de;
 
 use core::{
     ops::{Deref, DerefMut},
     str::FromStr,
 };
 
-use chrono::{DateTime, NaiveDateTime, TimeZone};
-use embassy_net::{
-    udp::{PacketMetadata, UdpSocket},
-    Ipv4Address, Ipv4Cidr, StackResources, StaticConfigV4,
-};
-use embassy_sync::{
-    blocking_mutex::raw::{CriticalSectionRawMutex, NoopRawMutex},
-    mutex::Mutex,
-};
-use embassy_time::{Duration, Ticker};
-
+use byteorder::ByteOrder;
 use esp32s3_hal::{
     clock::ClockControl,
     cpu_control::{self, CpuControl},
@@ -28,7 +22,6 @@ use esp32s3_hal::{
     gdma::*,
     peripherals::Peripherals,
     prelude::*,
-    rng,
     rtc_cntl::RtcClock,
     spi::{
         master::{prelude::*, Spi},
@@ -38,17 +31,33 @@ use esp32s3_hal::{
     Rng, Rtc, IO,
 };
 use esp_backtrace as _;
-use esp_println::println;
 use esp_wifi::wifi::{WifiController, WifiDevice, WifiEvent, WifiStaDevice, WifiState};
 
-use embedded_svc::wifi::Wifi;
+use embassy_net::{
+    tcp::TcpSocket,
+    udp::{PacketMetadata, UdpSocket},
+    Ipv4Address, Ipv4Cidr, StackResources, StaticConfigV4,
+};
+use embassy_sync::{
+    blocking_mutex::raw::{CriticalSectionRawMutex, NoopRawMutex},
+    mutex::Mutex,
+};
+use embassy_time::{Duration, Instant, Ticker, Timer};
+
+use embedded_svc::{
+    io::{
+        asynch::{Read, Write},
+        ReadReady,
+    },
+    wifi::Wifi,
+};
+
+use chrono::{DateTime, NaiveDateTime, TimeZone, Timelike};
 use heapless::Vec;
 use micromath::F32Ext;
-use sntp::UnixTimeStamp;
-use tz_de::TzDe;
 
-mod sntp;
-mod tz_de;
+use patterns::DIGITS_3_5;
+use tz_de::TzDe;
 
 const ROWS: usize = 16;
 const COLS: usize = 16;
@@ -81,9 +90,10 @@ static mut RENDER_BUF_2: RenderBuffer = RenderBuffer::empty();
 
 static mut RENDER_BUF_PTR_USED: Mutex<CriticalSectionRawMutex, *mut RenderBuffer> =
     Mutex::new(unsafe { &mut RENDER_BUF_1 } as *mut RenderBuffer);
+static mut FRAME_COUNTER: u32 = 0;
 
 #[derive(Copy, Clone, Debug)]
-struct RenderBuffer([u8; COLS * ROWS]);
+struct RenderBuffer([[u8; COLS]; ROWS]);
 
 impl Default for RenderBuffer {
     fn default() -> Self {
@@ -93,11 +103,24 @@ impl Default for RenderBuffer {
 
 impl RenderBuffer {
     const fn empty() -> Self {
-        Self([0; COLS * ROWS])
+        Self([[0; COLS]; ROWS])
+    }
+
+    const fn as_continuous(&self) -> &[u8] {
+        unsafe { core::slice::from_raw_parts((&self.0) as *const _ as *const u8, ROWS * COLS) }
+    }
+    const fn as_continuous_mut(&mut self) -> &mut [u8] {
+        unsafe { core::slice::from_raw_parts_mut((&mut self.0) as *mut _ as *mut u8, ROWS * COLS) }
+    }
+
+    fn reset(&mut self) {
+        for v in self.as_continuous_mut() {
+            *v = 0;
+        }
     }
 
     fn invert(mut self) -> Self {
-        for value in self.0.iter_mut() {
+        for value in self.as_continuous_mut() {
             *value = 255 - *value;
         }
         self
@@ -105,7 +128,7 @@ impl RenderBuffer {
 
     fn even_on() -> Self {
         let mut buf = Self::default();
-        for value in buf.0.iter_mut().step_by(2) {
+        for value in buf.as_continuous_mut().iter_mut().step_by(2) {
             *value = 255;
         }
         buf
@@ -117,7 +140,7 @@ impl RenderBuffer {
 
     fn first_row_inc() -> Self {
         let mut buf = Self::default();
-        for (i, value) in buf.0.iter_mut().take(COLS).enumerate() {
+        for (i, value) in buf.0[0].iter_mut().enumerate() {
             *value = i as u8 * COLS as u8 + 15;
         }
         buf
@@ -126,15 +149,46 @@ impl RenderBuffer {
     fn corner_distance() -> Self {
         const NORM: f32 = 1.0 / (16.0 * core::f32::consts::SQRT_2);
         let mut buf = Self::default();
-        for (idx, value) in buf.0.iter_mut().enumerate() {
-            let x = idx % 16;
-            let y = idx / 16;
-            *value = (255.0 * (1.0 - ((x.pow(2) + y.pow(2)) as f32).sqrt() * NORM)) as u8;
+        for (y, row) in buf.0.iter_mut().enumerate() {
+            for (x, value) in row.iter_mut().enumerate() {
+                *value = (255.0 * (1.0 - ((x.pow(2) + y.pow(2)) as f32).sqrt() * NORM)) as u8;
+            }
         }
         buf
     }
+
+    fn test_pattern() -> Self {
+        let mut buf = Self::default();
+        for (i, line) in buf.0.iter_mut().enumerate() {
+            for (j, pixel) in line.iter_mut().enumerate() {
+                *pixel = (16 * i + j) as u8;
+            }
+        }
+        buf
+    }
+
+    fn show_time<T: chrono::TimeZone>(&mut self, time: &DateTime<T>) {
+        let hours = time.hour();
+        let minutes = time.minute();
+        self.show_number_3_5(hours as u8 / 10, 3, 1);
+        self.show_number_3_5(hours as u8 % 10, 7, 1);
+        self.show_number_3_5(minutes as u8 / 10, 3, 8);
+        self.show_number_3_5(minutes as u8 % 10, 7, 8);
+    }
+
+    fn show_number_3_5(&mut self, digit: u8, offset_x: usize, offset_y: usize) {
+        for (image_row, digit_row) in self.0[offset_y..]
+            .iter_mut()
+            .zip(&DIGITS_3_5[digit as usize])
+        {
+            for (image_pixel, digit_pixel) in image_row[offset_x..].iter_mut().zip(digit_row) {
+                *image_pixel = *digit_pixel;
+            }
+        }
+    }
 }
 
+const RENDER_LOOP_DURATION: u64 = 50;
 #[embassy_executor::task]
 async fn render_loop(
     spi: Spi<'static, esp32s3_hal::peripherals::SPI2, FullDuplexMode>,
@@ -142,12 +196,12 @@ async fn render_loop(
 ) {
     let mut min_brightness = 0_u16;
     let mut pixel_bits: [u8; ROWS * COLS / 8] = [0_u8; ROWS * COLS / 8];
-    let mut ticker = Ticker::every(Duration::from_micros(100));
+    let mut ticker = Ticker::every(Duration::from_micros(RENDER_LOOP_DURATION));
 
-    let (mut descriptors, mut rx_descriptors) = dma_descriptors!(32000);
+    let (mut tx_descriptors, mut rx_descriptors) = dma_descriptors!(4092);
     let mut spi = spi.with_dma(dma_channel.configure(
         false,
-        &mut descriptors,
+        &mut tx_descriptors,
         &mut rx_descriptors,
         DmaPriority::Priority9,
     ));
@@ -158,7 +212,11 @@ async fn render_loop(
         let buffer_guard = unsafe { RENDER_BUF_PTR_USED.lock() }.await;
         let buffer = unsafe { &**buffer_guard.deref() };
         for idx in 0..ROWS * COLS {
-            let b_val = buffer.0[POSITIONS[idx] as usize] as u16;
+            let mut b_val = buffer.as_continuous()[POSITIONS[idx] as usize];
+            // if b_val == 1 {
+            //     b_val += 1;
+            // }
+            let b_val = b_val as u16;
 
             //if b_val >= *min_brightness {
             if (b_val * mb) / (GRAY_LEVELS - 1) != (b_val * mb_1) / (GRAY_LEVELS - 1) {
@@ -166,6 +224,9 @@ async fn render_loop(
             } else {
                 pixel_bits[idx / 8] &= !(0b1000_0000 >> (idx % 8));
             };
+        }
+        unsafe {
+            FRAME_COUNTER += 1;
         }
         drop(buffer_guard);
         min_brightness = (min_brightness + BRIGHTNESS_STEP) % 256;
@@ -182,8 +243,17 @@ async fn render(editable_buffer: &mut &mut RenderBuffer) {
     let render_buf_used = render_buf_used_guard.deref_mut();
     let new_free_render_buf = *render_buf_used;
     *render_buf_used = *editable_buffer;
+    let frame_count;
+    unsafe {
+        frame_count = FRAME_COUNTER;
+        FRAME_COUNTER = 0;
+    }
     drop(render_buf_used_guard);
     *editable_buffer = unsafe { &mut *new_free_render_buf };
+    // log::info!(
+    //     "Displayed frame {:.3} times [{frame_count} repetitions]",
+    //     (frame_count as f32) / 256.0
+    // );
 }
 
 const SSID: &str = "5G fuer alte!";
@@ -192,13 +262,24 @@ const PASSWORD: &str = "59663346713734943174";
 const RX_BUFFER_SIZE_UDP: usize = 1024;
 const TX_BUFFER_SIZE_UDP: usize = 1024;
 
+const RX_BUFFER_SIZE_STREAM: usize = 2048;
+const TX_BUFFER_SIZE_STREAM: usize = 64;
+
+const RX_BUFFER_SIZE_CONTROL: usize = 1024;
+const TX_BUFFER_SIZE_CONTROL: usize = 64;
+
+const RX_BUFFER_SIZE_TIME: usize = 1024;
+const TX_BUFFER_SIZE_TIME: usize = 64;
+
+const STREAM_ADDR: (Ipv4Address, u16) = (Ipv4Address::new(192, 168, 178, 30), 3123);
+
 #[embassy_executor::task]
 async fn connection(
     mut controller: WifiController<'static>,
     enabled_signal: &'static embassy_sync::signal::Signal<NoopRawMutex, ()>,
 ) {
-    println!("start connection task");
-    println!("Device capabilities: {:?}", controller.get_capabilities());
+    log::trace!("start connection task");
+    log::info!("Device capabilities: {:?}", controller.get_capabilities());
     loop {
         if esp_wifi::wifi::get_wifi_state() == WifiState::StaConnected {
             // wait until we're no longer connected
@@ -216,19 +297,19 @@ async fn connection(
                 },
             );
             controller.set_configuration(&client_config).unwrap();
-            println!("Starting wifi");
+            log::info!("Starting wifi");
             controller.start().await.unwrap();
-            println!("Wifi started!");
+            log::info!("Wifi started!");
         }
-        println!("About to connect...");
+        log::trace!("About to connect...");
 
         match controller.connect().await {
             Ok(_) => {
-                println!("Wifi connected!");
+                log::info!("Wifi connected!");
                 enabled_signal.signal(());
             }
             Err(e) => {
-                println!("Failed to connect to wifi: {e:?}");
+                log::error!("Failed to connect to wifi: {e:?}");
                 embassy_time::Timer::after(Duration::from_millis(5000)).await
             }
         }
@@ -240,31 +321,51 @@ async fn net_task(stack: &'static embassy_net::Stack<WifiDevice<'static, WifiSta
     stack.run().await
 }
 
-struct RtcOffset {
-    secs: u64,
-    micros: u32,
+#[embassy_executor::task]
+async fn rtc_adjust_task(
+    wifi_program_stack: &'static embassy_net::Stack<WifiDevice<'static, WifiStaDevice>>,
+    rtc: &'static Rtc<'_>,
+    rtc_offset_signal: &'static embassy_sync::signal::Signal<NoopRawMutex, RtcOffset>,
+) {
+    let mut time_rx_buffer = [0; RX_BUFFER_SIZE_TIME];
+    let mut time_tx_buffer = [0; TX_BUFFER_SIZE_TIME];
+    let mut time_socket =
+        TcpSocket::new(wifi_program_stack, &mut time_rx_buffer, &mut time_tx_buffer);
+    if let Err(time_connection_error) = time_socket
+        .connect((Ipv4Address::new(192, 168, 178, 30), 3125))
+        .await
+    {
+        log::warn!("Connection error: {time_connection_error:?}");
+    } else {
+        log::info!("Time Control Connected!");
+    }
+
+    let mut unix_time_buffer = [0_u8; 8];
+    time_socket.read_exact(&mut unix_time_buffer).await.unwrap();
+    let rtc_offset = get_rtc_offset(rtc, u64::from_le_bytes(unix_time_buffer));
+    rtc_offset_signal.signal(rtc_offset);
+
+    loop {
+        time_socket.read_exact(&mut unix_time_buffer).await.unwrap();
+        let rtc_offset = get_rtc_offset(rtc, u64::from_le_bytes(unix_time_buffer));
+        rtc_offset_signal.signal(rtc_offset);
+    }
 }
 
-fn adjust_rtc(rtc: &Rtc, rtc_offset: &mut RtcOffset, unix_time: &UnixTimeStamp) {
-    // Convert Unix timestamp to DateTime<Utc>
-    let rtc_time_raw = rtc.get_time_raw();
-    let rtc_time_micros =
-        rtc_time_raw * 1_000_000 / RtcClock::get_slow_freq().frequency().to_Hz() as u64;
-    let rtc_micros = (rtc_time_micros % 1_000_000) as u32;
-    let rtc_secs = rtc_time_micros / 1_000_000;
-    rtc_offset.secs = (unix_time.secs - rtc_secs as i64) as u64;
-    let unix_micros = unix_time.nanos / 1000;
-    if unix_micros >= rtc_micros {
-        rtc_offset.micros = unix_micros - rtc_micros;
-    } else {
-        rtc_offset.secs -= 1;
-        rtc_offset.micros = (1_000_000 + unix_micros) - rtc_micros;
+#[derive(Copy, Clone, Debug)]
+struct RtcOffset {
+    secs: u64,
+}
+
+fn get_rtc_offset(rtc: &Rtc, unix_time: u64) -> RtcOffset {
+    let rtc_secs = rtc.get_time_ms() / 1_000;
+    RtcOffset {
+        secs: unix_time - rtc_secs,
     }
 }
 
 fn get_german_datetime(rtc: &Rtc, rtc_offset: &RtcOffset) -> DateTime<TzDe> {
-    // Convert Unix timestamp to DateTime<Utc>
-    let micros = rtc.get_time_us() + rtc_offset.micros as u64;
+    let micros = rtc.get_time_us();
     let unix_secs = micros / 1_000_000 + rtc_offset.secs;
     let naive_dt =
         NaiveDateTime::from_timestamp_opt(unix_secs as i64, ((micros % 1_000_000) * 1_000) as u32)
@@ -272,12 +373,34 @@ fn get_german_datetime(rtc: &Rtc, rtc_offset: &RtcOffset) -> DateTime<TzDe> {
     TzDe.from_utc_datetime(&naive_dt)
 }
 
+async fn start_stream(
+    stream_socket: &mut TcpSocket<'_>,
+    state: &mut State,
+    frame_duration_micros: &mut u64,
+) {
+    if let Err(stream_connection_error) = stream_socket.connect(STREAM_ADDR).await {
+        log::warn!("Connection error: {stream_connection_error:?}");
+        *state = State::Clock;
+        return;
+    }
+
+    log::info!("Stream Connected!");
+    let mut fps_decoder_buf = [0_u8; 4];
+    stream_socket
+        .read_exact(&mut fps_decoder_buf)
+        .await
+        .unwrap();
+    let fps = byteorder::LE::read_f32(&fps_decoder_buf);
+    log::info!("Playing at {fps:.2} FPS");
+    *frame_duration_micros = (1_000_000.0 / fps).round() as u64;
+}
+
 #[main]
 async fn main(spawner: embassy_executor::Spawner) -> ! {
     esp_println::logger::init_logger(log::LevelFilter::Info);
 
     let peripherals = Peripherals::take();
-    let system = peripherals.SYSTEM.split();
+    let system: esp32s3_hal::system::SystemParts<'_> = peripherals.SYSTEM.split();
 
     let clocks = ClockControl::max(system.clock_control).freeze();
     let mut cpu_control = CpuControl::new(system.cpu_control);
@@ -285,17 +408,11 @@ async fn main(spawner: embassy_executor::Spawner) -> ! {
     embassy::init(&clocks, timer_group0);
 
     let io = IO::new(peripherals.GPIO, peripherals.IO_MUX);
-    println!("Hello world!");
-    println!(
-        "App core stack from {:?} to {:?}",
-        unsafe { APP_CORE_STACK.bottom() },
-        unsafe { APP_CORE_STACK.top() }
-    );
+    log::info!("Hello world!");
 
-    let rtc = Rtc::new(peripherals.LPWR);
-    let mut rtc_offset = RtcOffset { secs: 0, micros: 0 };
+    let rtc = &*static_cell::make_static!(Rtc::new(peripherals.LPWR));
 
-    let _btn = io.pins.gpio1.into_pull_down_input();
+    let btn = io.pins.gpio1.into_pull_up_input();
     let mut screen_override = io.pins.gpio2.into_push_pull_output();
     screen_override.set_low().unwrap();
 
@@ -313,7 +430,7 @@ async fn main(spawner: embassy_executor::Spawner) -> ! {
         Some(miso),
         Some(cs),
     );
-    println!("Created spi!");
+    log::info!("Created spi!");
 
     let timer = esp32s3_hal::timer::TimerGroup::new(peripherals.TIMG1, &clocks).timer0;
     let wifi_init = esp_wifi::initialize(
@@ -328,13 +445,13 @@ async fn main(spawner: embassy_executor::Spawner) -> ! {
     let wifi = peripherals.WIFI;
     let (wifi_interface, wifi_controller) =
         esp_wifi::wifi::new_with_mode(&wifi_init, wifi, WifiStaDevice).unwrap();
+
     let dns_servers = Vec::from_slice(&[
         Ipv4Address([192, 168, 178, 30]),
         Ipv4Address([192, 168, 178, 30]),
         Ipv4Address([192, 168, 178, 30]),
     ])
     .unwrap();
-
     let config = embassy_net::Config::ipv4_static(StaticConfigV4 {
         address: Ipv4Cidr::new(Ipv4Address([192, 168, 178, 40]), 24),
         gateway: Some(Ipv4Address([192, 168, 178, 1])),
@@ -342,40 +459,52 @@ async fn main(spawner: embassy_executor::Spawner) -> ! {
     });
 
     let seed = 666722646956068949;
-
     let wifi_program_stack = &*static_cell::make_static!(embassy_net::Stack::new(
         wifi_interface,
         config,
         static_cell::make_static!(StackResources::<3>::new()),
         seed
     ));
+    spawner.spawn(net_task(wifi_program_stack)).unwrap();
 
     let wifi_enabled_signal: &embassy_sync::signal::Signal<NoopRawMutex, ()> =
         static_cell::make_static!(embassy_sync::signal::Signal::new());
-
     spawner
         .spawn(connection(wifi_controller, wifi_enabled_signal))
         .unwrap();
-    spawner.spawn(net_task(wifi_program_stack)).unwrap();
     wifi_enabled_signal.wait().await;
 
-    let mut rx_buffer = [0; RX_BUFFER_SIZE_UDP];
-    let mut tx_buffer = [0; TX_BUFFER_SIZE_UDP];
+    let rtc_offset_signal: &embassy_sync::signal::Signal<NoopRawMutex, RtcOffset> =
+        static_cell::make_static!(embassy_sync::signal::Signal::new());
+    spawner
+        .spawn(rtc_adjust_task(wifi_program_stack, rtc, rtc_offset_signal))
+        .unwrap();
+    let mut rtc_offset = rtc_offset_signal.wait().await;
 
-    let mut rx_meta_buffer = [PacketMetadata::EMPTY; RX_BUFFER_SIZE_UDP];
-    let mut tx_meta_buffer = [PacketMetadata::EMPTY; TX_BUFFER_SIZE_UDP];
-    let mut socket = UdpSocket::new(
+    let mut control_rx_buffer = [0; RX_BUFFER_SIZE_CONTROL];
+    let mut control_tx_buffer = [0; TX_BUFFER_SIZE_CONTROL];
+    let mut control_socket = TcpSocket::new(
         wifi_program_stack,
-        &mut rx_meta_buffer,
-        &mut rx_buffer,
-        &mut tx_meta_buffer,
-        &mut tx_buffer,
+        &mut control_rx_buffer,
+        &mut control_tx_buffer,
     );
-    socket.bind(34254).unwrap();
-    let unix_timestamp = crate::sntp::get_timestamp_ntp(&mut socket).await;
-    println!("Time stamp: {unix_timestamp:?}");
-    adjust_rtc(&rtc, &mut rtc_offset, &unix_timestamp);
-    println!("In germany: {}", get_german_datetime(&rtc, &rtc_offset));
+    if let Err(control_connection_error) = control_socket
+        .connect((Ipv4Address::new(192, 168, 178, 30), 3124))
+        .await
+    {
+        log::warn!("Connection error: {control_connection_error:?}");
+    } else {
+        log::info!("State Control Connected!");
+    }
+
+    let mut stream_rx_buffer = [0; RX_BUFFER_SIZE_STREAM];
+    let mut stream_tx_buffer = [0; TX_BUFFER_SIZE_STREAM];
+
+    let mut stream_socket = TcpSocket::new(
+        wifi_program_stack,
+        &mut stream_rx_buffer,
+        &mut stream_tx_buffer,
+    );
 
     let cpu1_fnctn = move || {
         let executor = static_cell::make_static!(Executor::new());
@@ -388,17 +517,75 @@ async fn main(spawner: embassy_executor::Spawner) -> ! {
         .unwrap();
 
     let mut editable_render_buf = unsafe { &mut RENDER_BUF_2 };
-    let mut ticker = Ticker::every(Duration::from_secs(3));
+
+    let mut state_decode_buf = [0_u8; 256];
+    let mut frame_duration_micros: u64 = 200_000;
+    log::info!("Entering main loop");
+
+    let mut frame = RenderBuffer::empty();
+    let mut state = State::Clock;
+    let mut last_btn_input = Instant::now();
 
     loop {
-        println!("Corner dist");
-        *editable_render_buf = RenderBuffer::corner_distance();
-        render(&mut editable_render_buf).await;
-        ticker.next().await;
+        if control_socket.can_recv() {
+            let n_bytes = control_socket.read(&mut state_decode_buf).await.unwrap();
+            if n_bytes != 0 && state != State::Stream {
+                start_stream(&mut stream_socket, &mut state, &mut frame_duration_micros).await;
+            }
+        }
+        if btn.is_low().unwrap()
+            && Instant::now().duration_since(last_btn_input) > Duration::from_millis(300)
+        {
+            last_btn_input = Instant::now();
+            log::info!("Got button input!");
+            state.toggle();
+            match state {
+                State::Clock => {
+                    stream_socket.abort();
+                    stream_socket.flush().await.unwrap();
+                    frame_duration_micros = 200_000;
+                    frame.reset();
+                }
+                State::Stream => {
+                    start_stream(&mut stream_socket, &mut state, &mut frame_duration_micros).await;
+                }
+            }
+        }
 
-        println!("First_row_inc");
-        *editable_render_buf = RenderBuffer::first_row_inc();
+        let frame_timer = Timer::after(Duration::from_micros(frame_duration_micros));
+        match state {
+            State::Stream => {
+                stream_socket
+                    .read_exact(frame.as_continuous_mut())
+                    .await
+                    .unwrap();
+            }
+            State::Clock => {
+                if rtc_offset_signal.signaled() {
+                    rtc_offset = rtc_offset_signal.wait().await;
+                }
+                let time = get_german_datetime(rtc, &rtc_offset);
+                frame.show_time(&time);
+            }
+        }
+
+        frame_timer.await;
+        *editable_render_buf = frame;
         render(&mut editable_render_buf).await;
-        ticker.next().await;
+    }
+}
+
+#[derive(Debug, PartialEq, Eq)]
+enum State {
+    Stream,
+    Clock,
+}
+
+impl State {
+    fn toggle(&mut self) {
+        *self = match self {
+            State::Stream => State::Clock,
+            State::Clock => State::Stream,
+        }
     }
 }
