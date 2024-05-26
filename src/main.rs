@@ -1,6 +1,5 @@
 #![no_std]
 #![no_main]
-#![feature(type_alias_impl_trait)]
 #![feature(const_mut_refs)]
 #![feature(const_slice_from_raw_parts_mut)]
 
@@ -8,39 +7,43 @@ mod patterns;
 mod tz_de;
 
 use core::{
+    mem,
     ops::{Deref, DerefMut},
+    ptr::addr_of_mut,
     str::FromStr,
 };
 
 use byteorder::ByteOrder;
-use embedded_hal_async::digital::Wait;
-use esp32s3_hal::{
+
+use esp_backtrace as _;
+use esp_hal::{
     clock::ClockControl,
     cpu_control::{self, CpuControl},
-    dma::DmaPriority,
+    dma::{ChannelCreator0, Dma, DmaPriority, DmaTransfer},
     dma_descriptors,
     embassy::{self, executor::Executor},
-    gdma::*,
+    gpio::IO,
     peripherals::Peripherals,
     prelude::*,
+    rng::Rng,
+    rtc_cntl::Rtc,
     spi::{
-        master::{prelude::*, Spi},
+        master::{dma::WithDmaSpi2, Spi},
         FullDuplexMode, SpiMode,
     },
     timer::TimerGroup,
-    Rng, Rtc, IO,
 };
-use esp_backtrace as _;
 use esp_wifi::wifi::{WifiController, WifiDevice, WifiEvent, WifiStaDevice, WifiState};
 
 use embassy_net::{tcp::TcpSocket, Ipv4Address, Ipv4Cidr, StackResources, StaticConfigV4};
 use embassy_sync::{
     blocking_mutex::raw::{CriticalSectionRawMutex, NoopRawMutex},
     mutex::Mutex,
+    signal::Signal,
 };
-use embassy_time::{Duration, Instant, Ticker, Timer};
+use embassy_time::{Duration, Ticker, Timer};
 
-use embedded_svc::{io::asynch::Read, wifi::Wifi};
+use embedded_svc::io::asynch::Read;
 
 use chrono::{DateTime, NaiveDateTime, TimeZone, Timelike};
 use heapless::Vec;
@@ -48,6 +51,15 @@ use micromath::F32Ext;
 
 use patterns::DIGITS_3_5;
 use tz_de::TzDe;
+
+macro_rules! mk_static {
+    ($t:path,$val:expr) => {{
+        static STATIC_CELL: static_cell::StaticCell<$t> = static_cell::StaticCell::new();
+        #[deny(unused_attributes)]
+        let x = STATIC_CELL.uninit().write(($val));
+        x
+    }};
+}
 
 const ROWS: usize = 16;
 const COLS: usize = 16;
@@ -79,7 +91,7 @@ static mut RENDER_BUF_1: RenderBuffer = RenderBuffer::empty();
 static mut RENDER_BUF_2: RenderBuffer = RenderBuffer::empty();
 
 static mut RENDER_BUF_PTR_USED: Mutex<CriticalSectionRawMutex, *mut RenderBuffer> =
-    Mutex::new(unsafe { &mut RENDER_BUF_1 } as *mut RenderBuffer);
+    Mutex::new(unsafe { addr_of_mut!(RENDER_BUF_1) });
 static mut FRAME_COUNTER: u32 = 0;
 
 #[derive(Copy, Clone, Debug)]
@@ -91,6 +103,7 @@ impl Default for RenderBuffer {
     }
 }
 
+#[allow(unused)]
 impl RenderBuffer {
     const fn empty() -> Self {
         Self([[0; COLS]; ROWS])
@@ -181,15 +194,19 @@ impl RenderBuffer {
 const RENDER_LOOP_DURATION: u64 = 50;
 #[embassy_executor::task]
 async fn render_loop(
-    spi: Spi<'static, esp32s3_hal::peripherals::SPI2, FullDuplexMode>,
+    spi: Spi<'static, esp_hal::peripherals::SPI2, FullDuplexMode>,
     dma_channel: ChannelCreator0,
 ) {
+    let (mut tx_descriptors, mut rx_descriptors) = dma_descriptors!(4096);
+
     let mut min_brightness = 0_u16;
-    let mut pixel_bits: [u8; ROWS * COLS / 8] = [0_u8; ROWS * COLS / 8];
+    static mut PIXEL_BITS_BUFFER_1: [u8; ROWS * COLS / 8] = [0_u8; ROWS * COLS / 8];
+    static mut PIXEL_BITS_BUFFER_2: [u8; ROWS * COLS / 8] = [0_u8; ROWS * COLS / 8];
+    let mut pixel_bits_buffer_writable = unsafe { addr_of_mut!(PIXEL_BITS_BUFFER_1) };
+    let mut pixel_bits_buffer_in_transfer = unsafe { addr_of_mut!(PIXEL_BITS_BUFFER_2) };
     let mut ticker = Ticker::every(Duration::from_micros(RENDER_LOOP_DURATION));
 
-    let (mut tx_descriptors, mut rx_descriptors) = dma_descriptors!(4092);
-    let mut spi = spi.with_dma(dma_channel.configure(
+    let mut spi = spi.with_dma(dma_channel.configure_for_async(
         false,
         &mut tx_descriptors,
         &mut rx_descriptors,
@@ -197,12 +214,15 @@ async fn render_loop(
     ));
 
     loop {
+        let buffer_in_transfer = unsafe { &*(pixel_bits_buffer_in_transfer as *const _) };
+        let spi_transfer = spi.dma_write(&buffer_in_transfer).unwrap();
+
         let mb = min_brightness;
         let mb_1 = mb + 1;
         let buffer_guard = unsafe { RENDER_BUF_PTR_USED.lock() }.await;
         let buffer = unsafe { &**buffer_guard.deref() };
-        for idx in 0..ROWS * COLS {
-            let mut b_val = buffer.as_continuous()[POSITIONS[idx] as usize];
+        for (idx, pixel_position) in POSITIONS.iter().copied().enumerate() {
+            let b_val = buffer.as_continuous()[pixel_position as usize];
             // if b_val == 1 {
             //     b_val += 1;
             // }
@@ -210,9 +230,13 @@ async fn render_loop(
 
             //if b_val >= *min_brightness {
             if (b_val * mb) / (GRAY_LEVELS - 1) != (b_val * mb_1) / (GRAY_LEVELS - 1) {
-                pixel_bits[idx / 8] |= 0b1000_0000 >> (idx % 8);
+                unsafe {
+                    (*pixel_bits_buffer_writable)[idx / 8] |= 0b1000_0000 >> (idx % 8);
+                }
             } else {
-                pixel_bits[idx / 8] &= !(0b1000_0000 >> (idx % 8));
+                unsafe {
+                    (*pixel_bits_buffer_writable)[idx / 8] &= !(0b1000_0000 >> (idx % 8));
+                }
             };
         }
         unsafe {
@@ -220,9 +244,12 @@ async fn render_loop(
         }
         drop(buffer_guard);
         min_brightness = (min_brightness + BRIGHTNESS_STEP) % 256;
-        embedded_hal_async::spi::SpiBus::write(&mut spi, &pixel_bits)
-            .await
-            .unwrap();
+
+        spi_transfer.wait().unwrap();
+        mem::swap(
+            &mut pixel_bits_buffer_writable,
+            &mut pixel_bits_buffer_in_transfer,
+        );
 
         ticker.next().await;
     }
@@ -269,7 +296,7 @@ const STREAM_ADDR: (Ipv4Address, u16) = (Ipv4Address::new(192, 168, 178, 30), 31
 #[embassy_executor::task]
 async fn connection(
     mut controller: WifiController<'static>,
-    enabled_signal: &'static embassy_sync::signal::Signal<NoopRawMutex, ()>,
+    enabled_signal: &'static Signal<NoopRawMutex, ()>,
 ) {
     log::trace!("start connection task");
     log::info!("Device capabilities: {:?}", controller.get_capabilities());
@@ -281,14 +308,13 @@ async fn connection(
             embassy_time::Timer::after(Duration::from_millis(5000)).await
         }
         if !matches!(controller.is_started(), Ok(true)) {
-            let client_config = embedded_svc::wifi::Configuration::Client(
-                embedded_svc::wifi::ClientConfiguration {
+            let client_config =
+                esp_wifi::wifi::Configuration::Client(esp_wifi::wifi::ClientConfiguration {
                     ssid: heapless::String::from_str(SSID).expect("SSID should be valid"),
                     password: heapless::String::from_str(PASSWORD)
                         .expect("Password should be valid"),
                     ..Default::default()
-                },
-            );
+                });
             controller.set_configuration(&client_config).unwrap();
             log::info!("Starting wifi");
             controller.start().await.unwrap();
@@ -318,12 +344,13 @@ async fn net_task(stack: &'static embassy_net::Stack<WifiDevice<'static, WifiSta
 async fn rtc_adjust_task(
     wifi_program_stack: &'static embassy_net::Stack<WifiDevice<'static, WifiStaDevice>>,
     rtc: &'static Rtc<'_>,
-    rtc_offset_signal: &'static embassy_sync::signal::Signal<NoopRawMutex, RtcOffset>,
+    rtc_offset_signal: &'static Signal<NoopRawMutex, RtcOffset>,
 ) {
-    let mut time_socket =
-        TcpSocket::new(wifi_program_stack, unsafe { &mut TIME_RX_BUFFER }, unsafe {
-            &mut TIME_TX_BUFFER
-        });
+    let mut time_socket = TcpSocket::new(
+        wifi_program_stack,
+        unsafe { &mut *addr_of_mut!(TIME_RX_BUFFER) },
+        unsafe { &mut *addr_of_mut!(TIME_TX_BUFFER) },
+    );
     if let Err(time_connection_error) = time_socket
         .connect((Ipv4Address::new(192, 168, 178, 30), 3125))
         .await
@@ -347,18 +374,29 @@ async fn rtc_adjust_task(
 
 #[embassy_executor::task]
 async fn button_read_task(
-    mut btn: esp32s3_hal::gpio::GpioPin<esp32s3_hal::gpio::Input<esp32s3_hal::gpio::PullUp>, 1>,
-    signal: &'static embassy_sync::signal::Signal<NoopRawMutex, ButtonPress>,
+    mut btn: esp_hal::gpio::GpioPin<esp_hal::gpio::Input<esp_hal::gpio::PullUp>, 1>,
+    signal: &'static Signal<NoopRawMutex, ButtonPress>,
 ) {
     loop {
-        btn.wait_for_falling_edge().await.unwrap();
-        Timer::after(Duration::from_millis(400)).await;
-        if btn.is_high().unwrap() {
-            signal.signal(ButtonPress::Short);
-        } else {
-            signal.signal(ButtonPress::Long);
-            btn.wait_for_rising_edge().await.unwrap();
+        btn.wait_for_falling_edge().await;
+        // False Positive Detection
+        Timer::after(Duration::from_millis(80)).await;
+        if btn.is_high() {
+            // Debounce
+            Timer::after(Duration::from_millis(80)).await;
+            continue;
         }
+        // Short Pulse detection; < 400ms
+        Timer::after(Duration::from_millis(320)).await;
+        if btn.is_high() {
+            signal.signal(ButtonPress::Short);
+        }
+        // Long Pulse detection; > 400ms
+        else {
+            signal.signal(ButtonPress::Long);
+            btn.wait_for_rising_edge().await;
+        }
+        // Debounce
         Timer::after(Duration::from_millis(400)).await;
     }
 }
@@ -411,52 +449,28 @@ async fn main(spawner: embassy_executor::Spawner) -> ! {
     esp_println::logger::init_logger(log::LevelFilter::Info);
 
     let peripherals = Peripherals::take();
-    let system: esp32s3_hal::system::SystemParts<'_> = peripherals.SYSTEM.split();
-
+    let system: esp_hal::system::SystemParts<'_> = peripherals.SYSTEM.split();
     let clocks = ClockControl::max(system.clock_control).freeze();
     let mut cpu_control = CpuControl::new(system.cpu_control);
-    let timer_group0 = TimerGroup::new(peripherals.TIMG0, &clocks);
+
+    let timer_group0 = TimerGroup::new_async(peripherals.TIMG0, &clocks);
     embassy::init(&clocks, timer_group0);
 
     let io = IO::new(peripherals.GPIO, peripherals.IO_MUX);
     log::info!("Hello world!");
 
-    let rtc = &*static_cell::make_static!(Rtc::new(peripherals.LPWR));
-
-    let btn = io.pins.gpio1.into_pull_up_input();
     let mut screen_override = io.pins.gpio2.into_push_pull_output();
-    screen_override.set_low().unwrap();
+    screen_override.set_low();
 
-    let sclk = io.pins.gpio40;
-    let miso = io.pins.gpio26;
-    let mosi = io.pins.gpio41;
-    let cs = io.pins.gpio42;
-
-    let dma = Gdma::new(peripherals.DMA);
-    let dma_channel: ChannelCreator0 = dma.channel0;
-
-    let spi = Spi::new(peripherals.SPI2, 4u32.MHz(), SpiMode::Mode0, &clocks).with_pins(
-        Some(sclk),
-        Some(mosi),
-        Some(miso),
-        Some(cs),
-    );
-    log::info!("Created spi!");
-
-    let button_signal: &embassy_sync::signal::Signal<NoopRawMutex, ButtonPress> =
-        static_cell::make_static!(embassy_sync::signal::Signal::new());
-    spawner.spawn(button_read_task(btn, button_signal)).unwrap();
-
-    let timer = esp32s3_hal::timer::TimerGroup::new(peripherals.TIMG1, &clocks).timer0;
+    let wifi_timer = TimerGroup::new(peripherals.TIMG1, &clocks, None).timer0;
     let wifi_init = esp_wifi::initialize(
         esp_wifi::EspWifiInitFor::Wifi,
-        timer,
+        wifi_timer,
         Rng::new(peripherals.RNG),
         system.radio_clock_control,
         &clocks,
     )
     .unwrap();
-
     let wifi = peripherals.WIFI;
     let (wifi_interface, wifi_controller) =
         esp_wifi::wifi::new_with_mode(&wifi_init, wifi, WifiStaDevice).unwrap();
@@ -472,25 +486,28 @@ async fn main(spawner: embassy_executor::Spawner) -> ! {
         gateway: Some(Ipv4Address([192, 168, 178, 1])),
         dns_servers,
     });
-
     let seed = 666722646956068949;
-    let wifi_program_stack = &*static_cell::make_static!(embassy_net::Stack::new(
-        wifi_interface,
-        config,
-        static_cell::make_static!(StackResources::<3>::new()),
-        seed
-    ));
+    let wifi_program_stack = &*mk_static!(
+        embassy_net::Stack<WifiDevice<'static, WifiStaDevice>>,
+        embassy_net::Stack::new(
+            wifi_interface,
+            config,
+            mk_static!(StackResources<3>, StackResources::<3>::new()),
+            seed
+        )
+    );
     spawner.spawn(net_task(wifi_program_stack)).unwrap();
 
-    let wifi_enabled_signal: &embassy_sync::signal::Signal<NoopRawMutex, ()> =
-        static_cell::make_static!(embassy_sync::signal::Signal::new());
+    let wifi_enabled_signal: &Signal<NoopRawMutex, ()> =
+        mk_static!(Signal<NoopRawMutex, ()>, Signal::new());
     spawner
         .spawn(connection(wifi_controller, wifi_enabled_signal))
         .unwrap();
     wifi_enabled_signal.wait().await;
 
-    let rtc_offset_signal: &embassy_sync::signal::Signal<NoopRawMutex, RtcOffset> =
-        static_cell::make_static!(embassy_sync::signal::Signal::new());
+    let rtc = &*mk_static!(Rtc, Rtc::new(peripherals.LPWR, None));
+    let rtc_offset_signal: &Signal<NoopRawMutex, RtcOffset> =
+        mk_static!(Signal<NoopRawMutex, RtcOffset>, Signal::new());
     spawner
         .spawn(rtc_adjust_task(wifi_program_stack, rtc, rtc_offset_signal))
         .unwrap();
@@ -498,8 +515,8 @@ async fn main(spawner: embassy_executor::Spawner) -> ! {
 
     let mut control_socket = TcpSocket::new(
         wifi_program_stack,
-        unsafe { &mut CONTROL_RX_BUFFER },
-        unsafe { &mut CONTROL_TX_BUFFER },
+        unsafe { &mut *addr_of_mut!(CONTROL_RX_BUFFER) },
+        unsafe { &mut *addr_of_mut!(CONTROL_TX_BUFFER) },
     );
     if let Err(control_connection_error) = control_socket
         .connect((Ipv4Address::new(192, 168, 178, 30), 3124))
@@ -512,21 +529,39 @@ async fn main(spawner: embassy_executor::Spawner) -> ! {
 
     let mut stream_socket = TcpSocket::new(
         wifi_program_stack,
-        unsafe { &mut STREAM_RX_BUFFER },
-        unsafe { &mut STREAM_TX_BUFFER },
+        unsafe { &mut *addr_of_mut!(STREAM_RX_BUFFER) },
+        unsafe { &mut *addr_of_mut!(STREAM_TX_BUFFER) },
     );
 
+    let sclk = io.pins.gpio40;
+    let miso = io.pins.gpio26;
+    let mosi = io.pins.gpio41;
+    let cs = io.pins.gpio42;
+    let spi = Spi::new(peripherals.SPI2, 4u32.MHz(), SpiMode::Mode0, &clocks).with_pins(
+        Some(sclk),
+        Some(mosi),
+        Some(miso),
+        Some(cs),
+    );
+    let dma = Dma::new(peripherals.DMA);
+    let dma_channel = dma.channel0;
     let cpu1_fnctn = move || {
-        let executor = static_cell::make_static!(Executor::new());
+        let executor = mk_static!(Executor, Executor::new());
         executor.run(|spawner| {
             spawner.spawn(render_loop(spi, dma_channel)).ok();
         });
     };
     let _guard = cpu_control
-        .start_app_core(unsafe { &mut APP_CORE_STACK }, cpu1_fnctn)
+        .start_app_core(unsafe { &mut *addr_of_mut!(APP_CORE_STACK) }, cpu1_fnctn)
         .unwrap();
+    log::info!("Started Spi renderer!");
 
-    let mut editable_render_buf = unsafe { &mut RENDER_BUF_2 };
+    let btn = io.pins.gpio1.into_pull_up_input();
+    let button_signal: &Signal<NoopRawMutex, ButtonPress> =
+        mk_static!(Signal<NoopRawMutex, ButtonPress>, Signal::new());
+    spawner.spawn(button_read_task(btn, button_signal)).unwrap();
+
+    let mut editable_render_buf = unsafe { &mut *addr_of_mut!(RENDER_BUF_2) };
 
     let mut state_decode_buf = [0_u8; 16];
     let mut frame_duration_micros: u64 = 200_000;
@@ -550,7 +585,7 @@ async fn main(spawner: embassy_executor::Spawner) -> ! {
                     stream_socket.flush().await.unwrap();
                 }
                 State::Off => {
-                    screen_override.set_low().unwrap();
+                    screen_override.set_low();
                 }
             }
             match button_signal.wait().await {
@@ -572,7 +607,7 @@ async fn main(spawner: embassy_executor::Spawner) -> ! {
                     start_stream(&mut stream_socket, &mut state, &mut frame_duration_micros).await;
                 }
                 State::Off => {
-                    screen_override.set_high().unwrap();
+                    screen_override.set_high();
                     frame_duration_micros = 1_000_000;
                 }
             }
