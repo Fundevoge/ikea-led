@@ -13,6 +13,7 @@ use core::{
 };
 
 use byteorder::ByteOrder;
+use embedded_hal_async::digital::Wait;
 use esp32s3_hal::{
     clock::ClockControl,
     cpu_control::{self, CpuControl},
@@ -22,7 +23,6 @@ use esp32s3_hal::{
     gdma::*,
     peripherals::Peripherals,
     prelude::*,
-    rtc_cntl::RtcClock,
     spi::{
         master::{prelude::*, Spi},
         FullDuplexMode, SpiMode,
@@ -33,24 +33,14 @@ use esp32s3_hal::{
 use esp_backtrace as _;
 use esp_wifi::wifi::{WifiController, WifiDevice, WifiEvent, WifiStaDevice, WifiState};
 
-use embassy_net::{
-    tcp::TcpSocket,
-    udp::{PacketMetadata, UdpSocket},
-    Ipv4Address, Ipv4Cidr, StackResources, StaticConfigV4,
-};
+use embassy_net::{tcp::TcpSocket, Ipv4Address, Ipv4Cidr, StackResources, StaticConfigV4};
 use embassy_sync::{
     blocking_mutex::raw::{CriticalSectionRawMutex, NoopRawMutex},
     mutex::Mutex,
 };
 use embassy_time::{Duration, Instant, Ticker, Timer};
 
-use embedded_svc::{
-    io::{
-        asynch::{Read, Write},
-        ReadReady,
-    },
-    wifi::Wifi,
-};
+use embedded_svc::{io::asynch::Read, wifi::Wifi};
 
 use chrono::{DateTime, NaiveDateTime, TimeZone, Timelike};
 use heapless::Vec;
@@ -243,9 +233,9 @@ async fn render(editable_buffer: &mut &mut RenderBuffer) {
     let render_buf_used = render_buf_used_guard.deref_mut();
     let new_free_render_buf = *render_buf_used;
     *render_buf_used = *editable_buffer;
-    let frame_count;
+    // let frame_count;
     unsafe {
-        frame_count = FRAME_COUNTER;
+        // frame_count = FRAME_COUNTER;
         FRAME_COUNTER = 0;
     }
     drop(render_buf_used_guard);
@@ -259,17 +249,20 @@ async fn render(editable_buffer: &mut &mut RenderBuffer) {
 const SSID: &str = "5G fuer alte!";
 const PASSWORD: &str = "59663346713734943174";
 
-const RX_BUFFER_SIZE_UDP: usize = 1024;
-const TX_BUFFER_SIZE_UDP: usize = 1024;
-
 const RX_BUFFER_SIZE_STREAM: usize = 2048;
 const TX_BUFFER_SIZE_STREAM: usize = 64;
+static mut STREAM_RX_BUFFER: [u8; RX_BUFFER_SIZE_STREAM] = [0; RX_BUFFER_SIZE_STREAM];
+static mut STREAM_TX_BUFFER: [u8; TX_BUFFER_SIZE_STREAM] = [0; TX_BUFFER_SIZE_STREAM];
 
 const RX_BUFFER_SIZE_CONTROL: usize = 1024;
 const TX_BUFFER_SIZE_CONTROL: usize = 64;
+static mut CONTROL_RX_BUFFER: [u8; RX_BUFFER_SIZE_CONTROL] = [0; RX_BUFFER_SIZE_CONTROL];
+static mut CONTROL_TX_BUFFER: [u8; TX_BUFFER_SIZE_CONTROL] = [0; TX_BUFFER_SIZE_CONTROL];
 
 const RX_BUFFER_SIZE_TIME: usize = 1024;
 const TX_BUFFER_SIZE_TIME: usize = 64;
+static mut TIME_RX_BUFFER: [u8; RX_BUFFER_SIZE_TIME] = [0; RX_BUFFER_SIZE_TIME];
+static mut TIME_TX_BUFFER: [u8; TX_BUFFER_SIZE_TIME] = [0; TX_BUFFER_SIZE_TIME];
 
 const STREAM_ADDR: (Ipv4Address, u16) = (Ipv4Address::new(192, 168, 178, 30), 3123);
 
@@ -327,10 +320,10 @@ async fn rtc_adjust_task(
     rtc: &'static Rtc<'_>,
     rtc_offset_signal: &'static embassy_sync::signal::Signal<NoopRawMutex, RtcOffset>,
 ) {
-    let mut time_rx_buffer = [0; RX_BUFFER_SIZE_TIME];
-    let mut time_tx_buffer = [0; TX_BUFFER_SIZE_TIME];
     let mut time_socket =
-        TcpSocket::new(wifi_program_stack, &mut time_rx_buffer, &mut time_tx_buffer);
+        TcpSocket::new(wifi_program_stack, unsafe { &mut TIME_RX_BUFFER }, unsafe {
+            &mut TIME_TX_BUFFER
+        });
     if let Err(time_connection_error) = time_socket
         .connect((Ipv4Address::new(192, 168, 178, 30), 3125))
         .await
@@ -349,6 +342,24 @@ async fn rtc_adjust_task(
         time_socket.read_exact(&mut unix_time_buffer).await.unwrap();
         let rtc_offset = get_rtc_offset(rtc, u64::from_le_bytes(unix_time_buffer));
         rtc_offset_signal.signal(rtc_offset);
+    }
+}
+
+#[embassy_executor::task]
+async fn button_read_task(
+    mut btn: esp32s3_hal::gpio::GpioPin<esp32s3_hal::gpio::Input<esp32s3_hal::gpio::PullUp>, 1>,
+    signal: &'static embassy_sync::signal::Signal<NoopRawMutex, ButtonPress>,
+) {
+    loop {
+        btn.wait_for_falling_edge().await.unwrap();
+        Timer::after(Duration::from_millis(400)).await;
+        if btn.is_high().unwrap() {
+            signal.signal(ButtonPress::Short);
+        } else {
+            signal.signal(ButtonPress::Long);
+            btn.wait_for_rising_edge().await.unwrap();
+        }
+        Timer::after(Duration::from_millis(400)).await;
     }
 }
 
@@ -432,6 +443,10 @@ async fn main(spawner: embassy_executor::Spawner) -> ! {
     );
     log::info!("Created spi!");
 
+    let button_signal: &embassy_sync::signal::Signal<NoopRawMutex, ButtonPress> =
+        static_cell::make_static!(embassy_sync::signal::Signal::new());
+    spawner.spawn(button_read_task(btn, button_signal)).unwrap();
+
     let timer = esp32s3_hal::timer::TimerGroup::new(peripherals.TIMG1, &clocks).timer0;
     let wifi_init = esp_wifi::initialize(
         esp_wifi::EspWifiInitFor::Wifi,
@@ -481,12 +496,10 @@ async fn main(spawner: embassy_executor::Spawner) -> ! {
         .unwrap();
     let mut rtc_offset = rtc_offset_signal.wait().await;
 
-    let mut control_rx_buffer = [0; RX_BUFFER_SIZE_CONTROL];
-    let mut control_tx_buffer = [0; TX_BUFFER_SIZE_CONTROL];
     let mut control_socket = TcpSocket::new(
         wifi_program_stack,
-        &mut control_rx_buffer,
-        &mut control_tx_buffer,
+        unsafe { &mut CONTROL_RX_BUFFER },
+        unsafe { &mut CONTROL_TX_BUFFER },
     );
     if let Err(control_connection_error) = control_socket
         .connect((Ipv4Address::new(192, 168, 178, 30), 3124))
@@ -497,13 +510,10 @@ async fn main(spawner: embassy_executor::Spawner) -> ! {
         log::info!("State Control Connected!");
     }
 
-    let mut stream_rx_buffer = [0; RX_BUFFER_SIZE_STREAM];
-    let mut stream_tx_buffer = [0; TX_BUFFER_SIZE_STREAM];
-
     let mut stream_socket = TcpSocket::new(
         wifi_program_stack,
-        &mut stream_rx_buffer,
-        &mut stream_tx_buffer,
+        unsafe { &mut STREAM_RX_BUFFER },
+        unsafe { &mut STREAM_TX_BUFFER },
     );
 
     let cpu1_fnctn = move || {
@@ -518,36 +528,52 @@ async fn main(spawner: embassy_executor::Spawner) -> ! {
 
     let mut editable_render_buf = unsafe { &mut RENDER_BUF_2 };
 
-    let mut state_decode_buf = [0_u8; 256];
+    let mut state_decode_buf = [0_u8; 16];
     let mut frame_duration_micros: u64 = 200_000;
     log::info!("Entering main loop");
 
     let mut frame = RenderBuffer::empty();
     let mut state = State::Clock;
-    let mut last_btn_input = Instant::now();
 
     loop {
         if control_socket.can_recv() {
             let n_bytes = control_socket.read(&mut state_decode_buf).await.unwrap();
-            if n_bytes != 0 && state != State::Stream {
+            if n_bytes != 0 && state != State::Stream && state != State::Off {
                 start_stream(&mut stream_socket, &mut state, &mut frame_duration_micros).await;
             }
         }
-        if btn.is_low().unwrap()
-            && Instant::now().duration_since(last_btn_input) > Duration::from_millis(300)
-        {
-            last_btn_input = Instant::now();
-            log::info!("Got button input!");
-            state.toggle();
+        if button_signal.signaled() {
             match state {
-                State::Clock => {
+                State::Clock => {}
+                State::Stream => {
                     stream_socket.abort();
                     stream_socket.flush().await.unwrap();
-                    frame_duration_micros = 200_000;
+                }
+                State::Off => {
+                    screen_override.set_low().unwrap();
+                }
+            }
+            match button_signal.wait().await {
+                ButtonPress::Short => {
+                    log::info!("Got short button input!");
+                    state.next();
+                }
+                ButtonPress::Long => {
+                    log::info!("Got long button input!");
+                    state.toggle_on_off();
+                }
+            }
+            match state {
+                State::Clock => {
+                    frame_duration_micros = 300_000;
                     frame.reset();
                 }
                 State::Stream => {
                     start_stream(&mut stream_socket, &mut state, &mut frame_duration_micros).await;
+                }
+                State::Off => {
+                    screen_override.set_high().unwrap();
+                    frame_duration_micros = 1_000_000;
                 }
             }
         }
@@ -567,6 +593,7 @@ async fn main(spawner: embassy_executor::Spawner) -> ! {
                 let time = get_german_datetime(rtc, &rtc_offset);
                 frame.show_time(&time);
             }
+            State::Off => {}
         }
 
         frame_timer.await;
@@ -579,13 +606,28 @@ async fn main(spawner: embassy_executor::Spawner) -> ! {
 enum State {
     Stream,
     Clock,
+    Off,
 }
 
 impl State {
-    fn toggle(&mut self) {
+    fn next(&mut self) {
         *self = match self {
             State::Stream => State::Clock,
             State::Clock => State::Stream,
-        }
+            State::Off => State::Clock,
+        };
     }
+
+    fn toggle_on_off(&mut self) {
+        *self = match self {
+            State::Off => State::Clock,
+            _ => State::Off,
+        };
+    }
+}
+
+#[derive(Debug, PartialEq, Eq, Clone, Copy)]
+enum ButtonPress {
+    Short,
+    Long,
 }
