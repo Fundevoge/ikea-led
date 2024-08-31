@@ -7,7 +7,7 @@ use core::{
 use chrono::{DateTime, Timelike as _};
 use embassy_time::{Duration, Ticker};
 use esp_hal::{
-    dma::{ChannelCreator0, DmaPriority, DmaTransfer as _},
+    dma::{ChannelCreator0, DmaPriority},
     dma_descriptors,
     spi::{
         master::{dma::WithDmaSpi2 as _, Spi},

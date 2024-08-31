@@ -16,15 +16,16 @@ use esp_hal::{
     clock::ClockControl,
     cpu_control::{self, CpuControl},
     dma::Dma,
-    embassy::{self, executor::Executor},
-    gpio::IO,
+    gpio::{self, GpioPin, Io},
     peripherals::Peripherals,
     prelude::*,
     rng::Rng,
     rtc_cntl::Rtc,
     spi::{master::Spi, SpiMode},
-    timer::TimerGroup,
+    system,
+    timer::timg::TimerGroup,
 };
+use esp_hal_embassy::{self, Executor};
 use esp_wifi::wifi::{WifiDevice, WifiStaDevice};
 
 use embassy_net::{tcp::TcpSocket, Ipv4Address, Ipv4Cidr, StackResources, StaticConfigV4};
@@ -101,7 +102,7 @@ static mut CONTROL_TX_BUFFER: [u8; TX_BUFFER_SIZE_CONTROL] = [0; TX_BUFFER_SIZE_
 
 #[embassy_executor::task]
 async fn button_read_task(
-    mut btn: esp_hal::gpio::GpioPin<esp_hal::gpio::Input<esp_hal::gpio::PullUp>, 1>,
+    mut btn: esp_hal::gpio::Input<'static, GpioPin<1>>,
     signal: &'static Signal<NoopRawMutex, ButtonPress>,
 ) {
     loop {
@@ -133,25 +134,24 @@ async fn main(spawner: embassy_executor::Spawner) -> ! {
     esp_println::logger::init_logger(log::LevelFilter::Info);
 
     let peripherals = Peripherals::take();
-    let system: esp_hal::system::SystemParts<'_> = peripherals.SYSTEM.split();
+    let system = system::SystemControl::new(peripherals.SYSTEM);
     let clocks = ClockControl::max(system.clock_control).freeze();
-    let mut cpu_control = CpuControl::new(system.cpu_control);
+    let mut cpu_control = CpuControl::new(peripherals.CPU_CTRL);
 
     let timer_group0 = TimerGroup::new_async(peripherals.TIMG0, &clocks);
-    embassy::init(&clocks, timer_group0);
+    esp_hal_embassy::init(&clocks, timer_group0);
 
-    let io = IO::new(peripherals.GPIO, peripherals.IO_MUX);
+    let io = Io::new(peripherals.GPIO, peripherals.IO_MUX);
     log::info!("Hello world!");
 
-    let mut screen_override = io.pins.gpio2.into_push_pull_output();
-    screen_override.set_low();
+    let mut screen_override = gpio::Output::new(io.pins.gpio2, gpio::Level::Low);
 
     let wifi_timer = TimerGroup::new(peripherals.TIMG1, &clocks, None).timer0;
     let wifi_init = esp_wifi::initialize(
         esp_wifi::EspWifiInitFor::Wifi,
         wifi_timer,
         Rng::new(peripherals.RNG),
-        system.radio_clock_control,
+        peripherals.RADIO_CLK,
         &clocks,
     )
     .unwrap();
@@ -246,7 +246,7 @@ async fn main(spawner: embassy_executor::Spawner) -> ! {
         .unwrap();
     log::info!("Started Spi renderer!");
 
-    let btn = io.pins.gpio1.into_pull_up_input();
+    let btn = gpio::Input::new(io.pins.gpio1, gpio::Pull::Up);
     let button_signal: &Signal<NoopRawMutex, ButtonPress> =
         mk_static!(Signal<NoopRawMutex, ButtonPress>, Signal::new());
     spawner.spawn(button_read_task(btn, button_signal)).unwrap();
