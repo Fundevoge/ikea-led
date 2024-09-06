@@ -7,12 +7,9 @@ use core::{
 use chrono::{DateTime, Timelike as _};
 use embassy_time::{Duration, Ticker};
 use esp_hal::{
-    dma::{ChannelCreator0, DmaPriority},
+    dma::{ChannelCreator0, DmaPriority, DmaTxBuf},
     dma_descriptors,
-    spi::{
-        master::{dma::WithDmaSpi2 as _, Spi},
-        FullDuplexMode,
-    },
+    spi::{master::Spi, FullDuplexMode},
 };
 use micromath::F32Ext;
 
@@ -147,7 +144,9 @@ pub(crate) async fn render_loop(
     spi: Spi<'static, esp_hal::peripherals::SPI2, FullDuplexMode>,
     dma_channel: ChannelCreator0,
 ) {
-    let (mut tx_descriptors, mut rx_descriptors) = dma_descriptors!(4096);
+    let mut spi = spi.with_dma(dma_channel.configure_for_async(false, DmaPriority::Priority9));
+    let (tx_descriptors, _rx_descriptors) = dma_descriptors!(4096);
+    let mut tx_descriptors: &mut [esp_hal::dma::DmaDescriptor] = tx_descriptors;
 
     let mut min_brightness = 0_u16;
     static mut PIXEL_BITS_BUFFER_1: [u8; ROWS * COLS / 8] = [0_u8; ROWS * COLS / 8];
@@ -156,16 +155,10 @@ pub(crate) async fn render_loop(
     let mut pixel_bits_buffer_in_transfer = unsafe { addr_of_mut!(PIXEL_BITS_BUFFER_2) };
     let mut ticker = Ticker::every(Duration::from_micros(RENDER_LOOP_DURATION_MICROS));
 
-    let mut spi = spi.with_dma(dma_channel.configure_for_async(
-        false,
-        &mut tx_descriptors,
-        &mut rx_descriptors,
-        DmaPriority::Priority9,
-    ));
-
     loop {
-        let buffer_in_transfer = unsafe { &*(pixel_bits_buffer_in_transfer as *const _) };
-        let spi_transfer = spi.dma_write(&buffer_in_transfer).unwrap();
+        let buffer_in_transfer = unsafe { &mut *(pixel_bits_buffer_in_transfer as *mut _) };
+        let dma_buffer_in_transfer = DmaTxBuf::new(tx_descriptors, buffer_in_transfer).unwrap();
+        let spi_transfer = spi.dma_write(dma_buffer_in_transfer).unwrap();
 
         let mb = min_brightness;
         let mb_1 = mb + 1;
@@ -195,7 +188,11 @@ pub(crate) async fn render_loop(
         drop(buffer_guard);
         min_brightness = (min_brightness + BRIGHTNESS_STEP) % 256;
 
-        spi_transfer.wait().unwrap();
+        let (spi_, buf) = spi_transfer.wait();
+        spi = spi_;
+        let (tx_desc, _) = buf.split();
+        tx_descriptors = tx_desc;
+
         mem::swap(
             &mut pixel_bits_buffer_writable,
             &mut pixel_bits_buffer_in_transfer,
