@@ -2,7 +2,9 @@
 #![no_main]
 #![feature(const_mut_refs)]
 #![feature(const_slice_from_raw_parts_mut)]
+#![feature(asm_experimental_arch)]
 
+// mod exceptions;
 mod network;
 mod patterns;
 mod render;
@@ -10,7 +12,6 @@ mod rtc;
 mod tz_de;
 
 use core::ptr::addr_of_mut;
-
 use esp_backtrace as _;
 use esp_hal::{
     clock::ClockControl,
@@ -41,17 +42,18 @@ use embedded_svc::io::asynch::Read;
 use heapless::Vec;
 
 use render::RenderBuffer;
+use static_cell::StaticCell;
 
 use crate::rtc::RtcOffset;
 
-macro_rules! mk_static {
-    ($t:path,$val:expr) => {{
-        static STATIC_CELL: static_cell::StaticCell<$t> = static_cell::StaticCell::new();
-        #[deny(unused_attributes)]
-        let x = STATIC_CELL.uninit().write(($val));
-        x
-    }};
-}
+// macro_rules! mk_static {
+//     ($t:path,$val:expr) => {{
+//         static STATIC_CELL: static_cell::StaticCell<$t> = static_cell::StaticCell::new();
+//         #[deny(unused_attributes)]
+//         let x = STATIC_CELL.uninit().write(($val));
+//         x
+//     }};
+// }
 
 #[derive(Debug, PartialEq, Eq, Clone, Copy)]
 enum ButtonPress {
@@ -138,15 +140,20 @@ async fn main(spawner: embassy_executor::Spawner) -> ! {
     let clocks = ClockControl::max(system.clock_control).freeze();
     let mut cpu_control = CpuControl::new(peripherals.CPU_CTRL);
 
-    let timer_group0 = TimerGroup::new_async(peripherals.TIMG0, &clocks);
-    esp_hal_embassy::init(&clocks, timer_group0);
+    use esp_hal::timer::systimer::{SystemTimer, Target};
+    let systimer = SystemTimer::new(peripherals.SYSTIMER).split::<Target>();
+    esp_hal_embassy::init(&clocks, systimer.alarm0);
 
     let io = Io::new(peripherals.GPIO, peripherals.IO_MUX);
     log::info!("Hello world!");
 
     let mut screen_override = gpio::Output::new(io.pins.gpio2, gpio::Level::Low);
 
-    let wifi_timer = TimerGroup::new(peripherals.TIMG1, &clocks, None).timer0;
+    static RTC: StaticCell<Rtc> = StaticCell::new();
+    let rtc: &'static Rtc = RTC.init(Rtc::new(peripherals.LPWR));
+
+    let wifi_timer = TimerGroup::new(peripherals.TIMG1, &clocks).timer0;
+
     let wifi_init = esp_wifi::initialize(
         esp_wifi::EspWifiInitFor::Wifi,
         wifi_timer,
@@ -155,6 +162,7 @@ async fn main(spawner: embassy_executor::Spawner) -> ! {
         &clocks,
     )
     .unwrap();
+
     let wifi = peripherals.WIFI;
     let (wifi_interface, wifi_controller) =
         esp_wifi::wifi::new_with_mode(&wifi_init, wifi, WifiStaDevice).unwrap();
@@ -171,29 +179,49 @@ async fn main(spawner: embassy_executor::Spawner) -> ! {
         dns_servers,
     });
     let seed = 666722646956068949;
-    let wifi_program_stack = &*mk_static!(
-        embassy_net::Stack<WifiDevice<'static, WifiStaDevice>>,
-        embassy_net::Stack::new(
+
+    static WIFI_STACK_RESOURCES: StaticCell<StackResources<4>> = StaticCell::new();
+    let wifi_stack_resources: &'static mut StackResources<4> =
+        &mut *WIFI_STACK_RESOURCES.init(StackResources::<4>::new());
+    static WIFI_PROGRAM_STACK: StaticCell<embassy_net::Stack<WifiDevice<'static, WifiStaDevice>>> =
+        StaticCell::new();
+    let wifi_program_stack: &'static embassy_net::Stack<WifiDevice<'_, WifiStaDevice>> =
+        &*WIFI_PROGRAM_STACK.init(embassy_net::Stack::new(
             wifi_interface,
             config,
-            mk_static!(StackResources<3>, StackResources::<3>::new()),
-            seed
-        )
-    );
+            wifi_stack_resources,
+            seed,
+        ));
+
     spawner
         .spawn(network::net_task(wifi_program_stack))
         .unwrap();
 
-    let wifi_enabled_signal: &Signal<NoopRawMutex, ()> =
-        mk_static!(Signal<NoopRawMutex, ()>, Signal::new());
+    static WIFI_ENABLED_SIGNAL: StaticCell<Signal<NoopRawMutex, ()>> = StaticCell::new();
+    let wifi_enabled_signal: &'static Signal<NoopRawMutex, ()> =
+        &*WIFI_ENABLED_SIGNAL.init(Signal::new());
+
     spawner
         .spawn(network::connection(wifi_controller, wifi_enabled_signal))
         .unwrap();
     wifi_enabled_signal.wait().await;
 
-    let rtc = &*mk_static!(Rtc, Rtc::new(peripherals.LPWR, None));
-    let rtc_offset_signal: &Signal<NoopRawMutex, RtcOffset> =
-        mk_static!(Signal<NoopRawMutex, RtcOffset>, Signal::new());
+    static KEEPALIVE_ESTABLISHED_SIGNAL: StaticCell<Signal<NoopRawMutex, ()>> = StaticCell::new();
+    let keepalive_established_signal: &'static Signal<NoopRawMutex, ()> =
+        &*KEEPALIVE_ESTABLISHED_SIGNAL.init(Signal::new());
+
+    spawner
+        .spawn(network::keep_alive(
+            wifi_program_stack,
+            keepalive_established_signal,
+        ))
+        .unwrap();
+    keepalive_established_signal.wait().await;
+
+    static RTC_OFFSET_SIGNAL: StaticCell<Signal<NoopRawMutex, RtcOffset>> = StaticCell::new();
+    let rtc_offset_signal: &'static Signal<NoopRawMutex, RtcOffset> =
+        &*RTC_OFFSET_SIGNAL.init(Signal::new());
+
     spawner
         .spawn(rtc::rtc_adjust_task(
             wifi_program_stack,
@@ -227,7 +255,7 @@ async fn main(spawner: embassy_executor::Spawner) -> ! {
     let miso = io.pins.gpio26;
     let mosi = io.pins.gpio41;
     let cs = io.pins.gpio42;
-    let spi = Spi::new(peripherals.SPI2, 4u32.MHz(), SpiMode::Mode0, &clocks).with_pins(
+    let spi = Spi::new(peripherals.SPI2, 4.MHz(), SpiMode::Mode0, &clocks).with_pins(
         Some(sclk),
         Some(mosi),
         Some(miso),
@@ -236,7 +264,8 @@ async fn main(spawner: embassy_executor::Spawner) -> ! {
     let dma = Dma::new(peripherals.DMA);
     let dma_channel = dma.channel0;
     let cpu1_fnctn = move || {
-        let executor = mk_static!(Executor, Executor::new());
+        static EXECUTOR: StaticCell<Executor> = StaticCell::new();
+        let executor: &'static mut Executor = &mut *EXECUTOR.init(Executor::new());
         executor.run(|spawner| {
             spawner.spawn(render::render_loop(spi, dma_channel)).ok();
         });
@@ -247,8 +276,11 @@ async fn main(spawner: embassy_executor::Spawner) -> ! {
     log::info!("Started Spi renderer!");
 
     let btn = gpio::Input::new(io.pins.gpio1, gpio::Pull::Up);
-    let button_signal: &Signal<NoopRawMutex, ButtonPress> =
-        mk_static!(Signal<NoopRawMutex, ButtonPress>, Signal::new());
+
+    static BUTTON_SIGNAL: StaticCell<Signal<NoopRawMutex, ButtonPress>> = StaticCell::new();
+    let button_signal: &'static Signal<NoopRawMutex, ButtonPress> =
+        &*BUTTON_SIGNAL.init(Signal::new());
+
     spawner.spawn(button_read_task(btn, button_signal)).unwrap();
 
     let mut editable_render_buf = unsafe { &mut *addr_of_mut!(RENDER_BUF_2) };
