@@ -7,7 +7,7 @@ use core::{
 use chrono::{DateTime, Timelike as _};
 use embassy_time::{Duration, Ticker};
 use esp_hal::{
-    dma::{ChannelCreator0, DmaPriority, DmaTxBuf},
+    dma::{ChannelCreator, DmaPriority, DmaTxBuf},
     dma_descriptors,
     spi::{master::Spi, FullDuplexMode},
 };
@@ -142,7 +142,7 @@ const RENDER_LOOP_DURATION_MICROS: u64 = 50;
 #[embassy_executor::task]
 pub(crate) async fn render_loop(
     spi: Spi<'static, esp_hal::peripherals::SPI2, FullDuplexMode>,
-    dma_channel: ChannelCreator0,
+    dma_channel: ChannelCreator<0>,
 ) {
     let mut spi = spi.with_dma(dma_channel.configure_for_async(false, DmaPriority::Priority9));
     let (tx_descriptors, _rx_descriptors) = dma_descriptors!(4096);

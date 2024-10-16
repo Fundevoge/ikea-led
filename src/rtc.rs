@@ -1,32 +1,22 @@
-use chrono::{DateTime, TimeZone as _, Utc};
+use chrono::{DateTime, TimeZone as _};
 use embassy_net::{tcp::TcpSocket, Ipv4Address};
 use embassy_sync::{blocking_mutex::raw::NoopRawMutex, signal::Signal};
-use embassy_time::Timer;
-use embedded_svc::io::asynch::{Read as _, Write as _};
+use embedded_svc::io::asynch::Read as _;
 use esp_hal::rtc_cntl::Rtc;
 use esp_wifi::wifi::{WifiDevice, WifiStaDevice};
 
 use crate::tz_de::TzDe;
 
-#[derive(Copy, Clone, Debug)]
-pub(crate) struct RtcOffset {
-    pub(crate) secs: u64,
+fn set_rtc_offset(rtc: &Rtc, unix_time: u64) {
+    rtc.set_current_time(
+        DateTime::from_timestamp(unix_time as i64, 0)
+            .unwrap()
+            .naive_utc(),
+    );
 }
 
-fn get_rtc_offset(rtc: &Rtc, unix_time: u64) -> RtcOffset {
-    let rtc_secs = rtc.get_time_ms() / 1_000;
-    RtcOffset {
-        secs: unix_time - rtc_secs,
-    }
-}
-
-pub(crate) fn get_german_datetime(rtc: &Rtc, rtc_offset: &RtcOffset) -> DateTime<TzDe> {
-    let micros = rtc.get_time_us();
-    let unix_secs = micros / 1_000_000 + rtc_offset.secs;
-    let dt_utc =
-        DateTime::<Utc>::from_timestamp(unix_secs as i64, ((micros % 1_000_000) * 1_000) as u32)
-            .unwrap();
-    TzDe.from_utc_datetime(&dt_utc.naive_utc())
+pub(crate) fn get_german_datetime(rtc: &Rtc) -> DateTime<TzDe> {
+    TzDe.from_utc_datetime(&rtc.current_time())
 }
 
 const RX_BUFFER_SIZE_TIME: usize = 1024;
@@ -38,7 +28,7 @@ const TX_BUFFER_SIZE_TIME: usize = 1024;
 pub(crate) async fn rtc_adjust_task(
     wifi_program_stack: &'static embassy_net::Stack<WifiDevice<'static, WifiStaDevice>>,
     rtc: &'static Rtc<'_>,
-    rtc_offset_signal: &'static Signal<NoopRawMutex, RtcOffset>,
+    rtc_offset_signal: &'static Signal<NoopRawMutex, ()>,
 ) {
     let mut time_rx_buffer = [0; RX_BUFFER_SIZE_TIME];
     let mut time_tx_buffer = [0; TX_BUFFER_SIZE_TIME];
@@ -56,12 +46,12 @@ pub(crate) async fn rtc_adjust_task(
 
     let mut unix_time_buffer = [0_u8; 8];
     time_socket.read_exact(&mut unix_time_buffer).await.unwrap();
-    let rtc_offset = get_rtc_offset(rtc, u64::from_le_bytes(unix_time_buffer));
-    rtc_offset_signal.signal(rtc_offset);
+    set_rtc_offset(rtc, u64::from_le_bytes(unix_time_buffer));
+    rtc_offset_signal.signal(());
 
     loop {
         time_socket.read_exact(&mut unix_time_buffer).await.unwrap();
-        let rtc_offset = get_rtc_offset(rtc, u64::from_le_bytes(unix_time_buffer));
-        rtc_offset_signal.signal(rtc_offset);
+        set_rtc_offset(rtc, u64::from_le_bytes(unix_time_buffer));
+        rtc_offset_signal.signal(());
     }
 }

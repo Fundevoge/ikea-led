@@ -14,16 +14,13 @@ mod tz_de;
 use core::ptr::addr_of_mut;
 use esp_backtrace as _;
 use esp_hal::{
-    clock::ClockControl,
     cpu_control::{self, CpuControl},
     dma::Dma,
     gpio::{self, GpioPin, Io},
-    peripherals::Peripherals,
     prelude::*,
     rng::Rng,
     rtc_cntl::Rtc,
     spi::{master::Spi, SpiMode},
-    system,
     timer::timg::TimerGroup,
 };
 use esp_hal_embassy::{self, Executor};
@@ -43,8 +40,6 @@ use heapless::Vec;
 
 use render::RenderBuffer;
 use static_cell::StaticCell;
-
-use crate::rtc::RtcOffset;
 
 // macro_rules! mk_static {
 //     ($t:path,$val:expr) => {{
@@ -135,14 +130,12 @@ async fn button_read_task(
 async fn main(spawner: embassy_executor::Spawner) -> ! {
     esp_println::logger::init_logger(log::LevelFilter::Info);
 
-    let peripherals = Peripherals::take();
-    let system = system::SystemControl::new(peripherals.SYSTEM);
-    let clocks = ClockControl::max(system.clock_control).freeze();
+    let peripherals = esp_hal::init(esp_hal::Config::default());
+    // let system = system::SystemControl::new(peripherals.SYSTEM);
     let mut cpu_control = CpuControl::new(peripherals.CPU_CTRL);
 
-    use esp_hal::timer::systimer::{SystemTimer, Target};
-    let systimer = SystemTimer::new(peripherals.SYSTIMER).split::<Target>();
-    esp_hal_embassy::init(&clocks, systimer.alarm0);
+    let timg0 = TimerGroup::new(peripherals.TIMG0);
+    esp_hal_embassy::init(timg0.timer0);
 
     let io = Io::new(peripherals.GPIO, peripherals.IO_MUX);
     log::info!("Hello world!");
@@ -152,14 +145,13 @@ async fn main(spawner: embassy_executor::Spawner) -> ! {
     static RTC: StaticCell<Rtc> = StaticCell::new();
     let rtc: &'static Rtc = RTC.init(Rtc::new(peripherals.LPWR));
 
-    let wifi_timer = TimerGroup::new(peripherals.TIMG1, &clocks).timer0;
+    let wifi_timer = TimerGroup::new(peripherals.TIMG1).timer0;
 
-    let wifi_init = esp_wifi::initialize(
+    let wifi_init = esp_wifi::init(
         esp_wifi::EspWifiInitFor::Wifi,
         wifi_timer,
         Rng::new(peripherals.RNG),
         peripherals.RADIO_CLK,
-        &clocks,
     )
     .unwrap();
 
@@ -218,8 +210,8 @@ async fn main(spawner: embassy_executor::Spawner) -> ! {
         .unwrap();
     keepalive_established_signal.wait().await;
 
-    static RTC_OFFSET_SIGNAL: StaticCell<Signal<NoopRawMutex, RtcOffset>> = StaticCell::new();
-    let rtc_offset_signal: &'static Signal<NoopRawMutex, RtcOffset> =
+    static RTC_OFFSET_SIGNAL: StaticCell<Signal<NoopRawMutex, ()>> = StaticCell::new();
+    let rtc_offset_signal: &'static Signal<NoopRawMutex, ()> =
         &*RTC_OFFSET_SIGNAL.init(Signal::new());
 
     spawner
@@ -229,7 +221,7 @@ async fn main(spawner: embassy_executor::Spawner) -> ! {
             rtc_offset_signal,
         ))
         .unwrap();
-    let mut rtc_offset = rtc_offset_signal.wait().await;
+    rtc_offset_signal.wait().await;
 
     let mut control_socket = TcpSocket::new(
         wifi_program_stack,
@@ -255,12 +247,7 @@ async fn main(spawner: embassy_executor::Spawner) -> ! {
     let miso = io.pins.gpio26;
     let mosi = io.pins.gpio41;
     let cs = io.pins.gpio42;
-    let spi = Spi::new(peripherals.SPI2, 4.MHz(), SpiMode::Mode0, &clocks).with_pins(
-        Some(sclk),
-        Some(mosi),
-        Some(miso),
-        Some(cs),
-    );
+    let spi = Spi::new(peripherals.SPI2, 4.MHz(), SpiMode::Mode0).with_pins(sclk, mosi, miso, cs);
     let dma = Dma::new(peripherals.DMA);
     let dma_channel = dma.channel0;
     let cpu1_fnctn = move || {
@@ -275,7 +262,7 @@ async fn main(spawner: embassy_executor::Spawner) -> ! {
         .unwrap();
     log::info!("Started Spi renderer!");
 
-    let btn = gpio::Input::new(io.pins.gpio1, gpio::Pull::Up);
+    let btn = gpio::Input::new_typed(io.pins.gpio1, gpio::Pull::Up);
 
     static BUTTON_SIGNAL: StaticCell<Signal<NoopRawMutex, ButtonPress>> = StaticCell::new();
     let button_signal: &'static Signal<NoopRawMutex, ButtonPress> =
@@ -351,9 +338,9 @@ async fn main(spawner: embassy_executor::Spawner) -> ! {
             }
             State::Clock => {
                 if rtc_offset_signal.signaled() {
-                    rtc_offset = rtc_offset_signal.wait().await;
+                    rtc_offset_signal.wait().await;
                 }
-                let time = rtc::get_german_datetime(rtc, &rtc_offset);
+                let time = rtc::get_german_datetime(rtc);
                 frame.show_time(&time);
             }
             State::Off => {}
