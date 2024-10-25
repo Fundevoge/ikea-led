@@ -3,6 +3,7 @@
 #![feature(const_mut_refs)]
 #![feature(const_slice_from_raw_parts_mut)]
 #![feature(asm_experimental_arch)]
+#![feature(slice_index_methods)]
 
 // mod exceptions;
 mod network;
@@ -56,25 +57,38 @@ enum ButtonPress {
     Long,
 }
 
-#[derive(Debug, PartialEq, Eq)]
+#[derive(Debug, PartialEq, Eq, Clone, Copy)]
 enum State {
     Stream,
-    Clock,
+    Clock(ClockType),
     Off,
+}
+
+impl Default for State {
+    fn default() -> Self {
+        State::Clock(ClockType::Large)
+    }
+}
+
+#[derive(Debug, PartialEq, Eq, Clone, Copy)]
+enum ClockType {
+    Small,
+    Large,
 }
 
 impl State {
     fn next(&mut self) {
         *self = match self {
-            State::Stream => State::Clock,
-            State::Clock => State::Stream,
-            State::Off => State::Clock,
+            State::Stream => State::Clock(ClockType::Large),
+            State::Clock(ClockType::Large) => State::Clock(ClockType::Small),
+            State::Clock(ClockType::Small) => State::Stream,
+            State::Off => Self::default(),
         };
     }
 
     fn toggle_on_off(&mut self) {
         *self = match self {
-            State::Off => State::Clock,
+            State::Off => Self::default(),
             _ => State::Off,
         };
     }
@@ -130,9 +144,14 @@ async fn button_read_task(
 async fn main(spawner: embassy_executor::Spawner) -> ! {
     esp_println::logger::init_logger(log::LevelFilter::Info);
 
-    let peripherals = esp_hal::init(esp_hal::Config::default());
-    // let system = system::SystemControl::new(peripherals.SYSTEM);
+    let peripherals = esp_hal::init({
+        let mut config = esp_hal::Config::default();
+        config.cpu_clock = CpuClock::max();
+        config
+    });
     let mut cpu_control = CpuControl::new(peripherals.CPU_CTRL);
+
+    esp_alloc::heap_allocator!(72 * 1024);
 
     let timg0 = TimerGroup::new(peripherals.TIMG0);
     esp_hal_embassy::init(timg0.timer0);
@@ -277,7 +296,7 @@ async fn main(spawner: embassy_executor::Spawner) -> ! {
     log::info!("Entering main loop");
 
     let mut frame = RenderBuffer::empty();
-    let mut state = State::Clock;
+    let mut state = State::default();
 
     loop {
         if control_socket.can_recv() {
@@ -288,8 +307,9 @@ async fn main(spawner: embassy_executor::Spawner) -> ! {
             }
         }
         if button_signal.signaled() {
+            // Cleanup previous state
             match state {
-                State::Clock => {}
+                State::Clock(_) => {}
                 State::Stream => {
                     stream_socket.abort();
                     stream_socket.flush().await.unwrap();
@@ -298,6 +318,7 @@ async fn main(spawner: embassy_executor::Spawner) -> ! {
                     screen_override.set_low();
                 }
             }
+            // Move to next State
             match button_signal.wait().await {
                 ButtonPress::Short => {
                     log::info!("Got short button input!");
@@ -308,10 +329,10 @@ async fn main(spawner: embassy_executor::Spawner) -> ! {
                     state.toggle_on_off();
                 }
             }
+            // Initialize next State
             match state {
-                State::Clock => {
+                State::Clock(_) => {
                     frame_duration_micros = 300_000;
-                    frame.reset();
                 }
                 State::Stream => {
                     network::start_stream(
@@ -336,12 +357,13 @@ async fn main(spawner: embassy_executor::Spawner) -> ! {
                     .await
                     .unwrap();
             }
-            State::Clock => {
+            State::Clock(clock_type) => {
                 if rtc_offset_signal.signaled() {
                     rtc_offset_signal.wait().await;
                 }
                 let time = rtc::get_german_datetime(rtc);
-                frame.show_time(&time);
+
+                frame.show_time(&time, clock_type);
             }
             State::Off => {}
         }

@@ -70,7 +70,7 @@ pub(crate) async fn start_stream(
 ) {
     if let Err(stream_connection_error) = stream_socket.connect(STREAM_ADDR).await {
         log::warn!("Connection error: {stream_connection_error:?}");
-        *state = crate::State::Clock;
+        *state = crate::State::default();
         return;
     }
 

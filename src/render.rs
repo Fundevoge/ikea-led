@@ -1,10 +1,10 @@
 use core::{
     mem,
-    ops::{Deref as _, DerefMut as _},
+    ops::{Deref, DerefMut},
     ptr::addr_of_mut,
 };
 
-use chrono::{DateTime, Timelike as _};
+use chrono::{DateTime, Timelike};
 use embassy_time::{Duration, Ticker};
 use esp_hal::{
     dma::{ChannelCreator, DmaPriority, DmaTxBuf},
@@ -13,7 +13,10 @@ use esp_hal::{
 };
 use micromath::F32Ext;
 
-use crate::patterns::DIGITS_3_5;
+use crate::{
+    patterns::{DIGITS_3_5, DIGITS_7_7},
+    ClockType,
+};
 
 const ROWS: usize = 16;
 const COLS: usize = 16;
@@ -40,6 +43,27 @@ const POSITIONS: [u8; COLS * ROWS] = [
     0xef, 0xee, 0xed, 0xec, 0xeb, 0xea, 0xe9, 0xe8, 0xf8, 0xf9, 0xfa, 0xfb, 0xfc, 0xfd, 0xfe, 0xff,
 ];
 static mut FRAME_COUNTER: u32 = 0;
+
+#[derive(PartialEq, Eq, Clone, Default, Debug)]
+struct Quadruplet<T> {
+    top_left: T,
+    top_right: T,
+    bottom_left: T,
+    bottom_right: T,
+}
+
+impl<T> From<[T; 4]> for Quadruplet<T> {
+    /// TL, TR, BL, BR
+    fn from(value: [T; 4]) -> Self {
+        let [top_left, top_right, bottom_left, bottom_right] = value;
+        Quadruplet {
+            top_left,
+            top_right,
+            bottom_left,
+            bottom_right,
+        }
+    }
+}
 
 #[derive(Copy, Clone, Debug)]
 pub(crate) struct RenderBuffer([[u8; COLS]; ROWS]);
@@ -117,21 +141,93 @@ impl RenderBuffer {
         buf
     }
 
-    pub(crate) fn show_time<T: chrono::TimeZone>(&mut self, time: &DateTime<T>) {
+    pub(crate) fn show_time<T: chrono::TimeZone>(
+        &mut self,
+        time: &DateTime<T>,
+        clock_type: ClockType,
+    ) {
         let hours = time.hour();
         let minutes = time.minute();
-        self.show_number_3_5(hours as u8 / 10, 3, 1);
-        self.show_number_3_5(hours as u8 % 10, 7, 1);
-        self.show_number_3_5(minutes as u8 / 10, 3, 8);
-        self.show_number_3_5(minutes as u8 % 10, 7, 8);
+        let digits = Quadruplet {
+            top_left: hours as u8 / 10,
+            top_right: hours as u8 % 10,
+            bottom_left: minutes as u8 / 10,
+            bottom_right: minutes as u8 % 10,
+        };
+
+        match clock_type {
+            ClockType::Small => self.show_4_numbers(
+                &DIGITS_3_5,
+                clock_type,
+                digits,
+                Quadruplet::from([(3, 1), (7, 1), (3, 8), (7, 8)]),
+            ),
+            ClockType::Large => self.show_4_numbers(
+                &DIGITS_7_7,
+                clock_type,
+                digits,
+                Quadruplet::from([(0, 0), (9, 0), (0, 8), (9, 8)]),
+            ),
+        }
     }
 
-    pub(crate) fn show_number_3_5(&mut self, digit: u8, offset_x: usize, offset_y: usize) {
-        for (image_row, digit_row) in self.0[offset_y..]
-            .iter_mut()
-            .zip(&DIGITS_3_5[digit as usize])
-        {
-            for (image_pixel, digit_pixel) in image_row[offset_x..].iter_mut().zip(digit_row) {
+    const fn kerning_right(right_num: u8) -> u8 {
+        match right_num {
+            1 | 3 => 1,
+            _ => 0,
+        }
+    }
+
+    fn show_4_numbers<const W: usize, const H: usize>(
+        &mut self,
+        font: &[[[u8; W]; H]; 10],
+        clock_type: ClockType,
+        digits: Quadruplet<u8>,
+        offsets: Quadruplet<(u8, u8)>,
+    ) {
+        self.reset();
+        self.show_number(
+            font,
+            digits.top_left,
+            offsets.top_left.0.into(),
+            offsets.top_left.1.into(),
+            0,
+        );
+        self.show_number(
+            font,
+            digits.top_right,
+            offsets.top_right.0.into(),
+            offsets.top_right.1.into(),
+            Self::kerning_right(digits.top_right).into(),
+        );
+        self.show_number(
+            font,
+            digits.bottom_left,
+            offsets.bottom_left.0.into(),
+            offsets.bottom_left.1.into(),
+            0,
+        );
+        self.show_number(
+            font,
+            digits.bottom_right,
+            offsets.bottom_right.0.into(),
+            offsets.bottom_right.1.into(),
+            Self::kerning_right(digits.bottom_right).into(),
+        );
+    }
+
+    fn show_number<const W: usize, const H: usize>(
+        &mut self,
+        font: &[[[u8; W]; H]; 10],
+        digit: u8,
+        offset_x: usize,
+        offset_y: usize,
+        kerning: usize,
+    ) {
+        for (image_row, digit_row) in self.0[offset_y..].iter_mut().zip(&font[digit as usize]) {
+            for (image_pixel, digit_pixel) in
+                image_row[offset_x..].iter_mut().zip(&digit_row[kerning..])
+            {
                 *image_pixel = *digit_pixel;
             }
         }

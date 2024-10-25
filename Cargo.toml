@@ -19,17 +19,23 @@ inherits = "release"
 debug = true
 
 [dependencies]
-xtensa-lx-rt = { version = "0.17.1", features = [
-    "float-save-restore",
-], default-features = false }
-
-esp-hal = { version = "0.21.0", features = [
+esp-alloc = "0.5.0"
+esp-backtrace = { version = "0.14.2", features = [
     "esp32s3",
+    "panic-handler",
+    "exception-handler",
+    "println",
+] }
+esp-hal = { version = "0.21.1", features = [
+    "esp32s3",
+    "log",
+    #    "debug",
 ], default-features = false }
 esp-hal-embassy = { version = "0.4.0", features = [
     "executors",
     "esp32s3",
 ], default-features = false }
+esp-println = { version = "0.12.0", features = ["esp32s3", "log"] }
 esp-wifi = { version = "0.10.1", features = [
     "esp32s3",
     "async",
@@ -41,14 +47,9 @@ esp-wifi = { version = "0.10.1", features = [
     "igmp",
     "dhcpv4",
     "wifi",
+    "utils",
 ] }
-esp-backtrace = { version = "0.14.2", features = [
-    "esp32s3",
-    "panic-handler",
-    "exception-handler",
-    "println",
-] }
-esp-println = { version = "0.12.0", features = ["esp32s3", "log"] }
+
 
 embassy-time = { version = "0.3.2", features = ["generic-queue-8"] }
 embassy-executor = { version = "0.6.0", features = ["task-arena-size-65536"] }
@@ -61,16 +62,20 @@ embassy-net = { version = "0.4.0", features = [
     "udp",
 ] }
 
-embedded-hal = "1.0.0"
+
 embedded-hal-async = "1.0.0"
 embedded-svc = { version = "0.28.0", default-features = false }
 
-micromath = "2.1.0"
-static_cell = { version = "2.1.0", features = ["nightly"] }
+
+byteorder = { version = "1.5.0", default-features = false }
+chrono = { version = "0.4.38", default-features = false }
+heapless = "0.8.0"
 log = "0.4.22"
+micromath = "2.1.0"
 smoltcp = { version = "0.11.0", features = [
     "proto-ipv4",
 ], default-features = false }
-heapless = "0.8.0"
-chrono = { version = "0.4.38", default-features = false }
-byteorder = { version = "1.5.0", default-features = false }
+static_cell = { version = "2.1.0", features = ["nightly"] }
+xtensa-lx-rt = { version = "0.17.1", features = [
+    "float-save-restore",
+], default-features = false }

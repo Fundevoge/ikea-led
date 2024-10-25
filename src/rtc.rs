@@ -1,7 +1,7 @@
-use chrono::{DateTime, TimeZone as _};
+use chrono::{DateTime, TimeZone};
 use embassy_net::{tcp::TcpSocket, Ipv4Address};
 use embassy_sync::{blocking_mutex::raw::NoopRawMutex, signal::Signal};
-use embedded_svc::io::asynch::Read as _;
+use embedded_svc::io::asynch::Read;
 use esp_hal::rtc_cntl::Rtc;
 use esp_wifi::wifi::{WifiDevice, WifiStaDevice};
 

@@ -498,9 +498,9 @@ dependencies = [
 
 [[package]]
 name = "esp-hal"
-version = "0.21.0"
+version = "0.21.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "ef2983f6fd1fdbd19217019958517257a0b6495e8aa618cb505612cc7ead44ec"
+checksum = "dae8535b3c6762c286dba6a206ab83637fb347ed26e99d99011726d9ee2f4082"
 dependencies = [
  "basic-toml",
  "bitfield",
@@ -869,9 +869,9 @@ dependencies = [
  "embassy-net",
  "embassy-sync 0.6.0",
  "embassy-time",
- "embedded-hal 1.0.0",
  "embedded-hal-async",
  "embedded-svc",
+ "esp-alloc",
  "esp-backtrace",
  "esp-hal",
  "esp-hal-embassy",
