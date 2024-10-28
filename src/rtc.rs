@@ -27,7 +27,7 @@ const TX_BUFFER_SIZE_TIME: usize = 1024;
 #[embassy_executor::task]
 pub(crate) async fn rtc_adjust_task(
     wifi_program_stack: &'static embassy_net::Stack<WifiDevice<'static, WifiStaDevice>>,
-    rtc: &'static Rtc<'_>,
+    rtc: &'static Rtc<'static>,
     rtc_offset_signal: &'static Signal<NoopRawMutex, ()>,
 ) {
     let mut time_rx_buffer = [0; RX_BUFFER_SIZE_TIME];

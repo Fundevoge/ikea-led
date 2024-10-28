@@ -171,13 +171,6 @@ impl RenderBuffer {
         }
     }
 
-    const fn kerning_right(right_num: u8) -> u8 {
-        match right_num {
-            1 | 3 => 1,
-            _ => 0,
-        }
-    }
-
     fn show_4_numbers<const W: usize, const H: usize>(
         &mut self,
         font: &[[[u8; W]; H]; 10],
@@ -191,28 +184,24 @@ impl RenderBuffer {
             digits.top_left,
             offsets.top_left.0.into(),
             offsets.top_left.1.into(),
-            0,
         );
         self.show_number(
             font,
             digits.top_right,
             offsets.top_right.0.into(),
             offsets.top_right.1.into(),
-            Self::kerning_right(digits.top_right).into(),
         );
         self.show_number(
             font,
             digits.bottom_left,
             offsets.bottom_left.0.into(),
             offsets.bottom_left.1.into(),
-            0,
         );
         self.show_number(
             font,
             digits.bottom_right,
             offsets.bottom_right.0.into(),
             offsets.bottom_right.1.into(),
-            Self::kerning_right(digits.bottom_right).into(),
         );
     }
 
@@ -222,12 +211,9 @@ impl RenderBuffer {
         digit: u8,
         offset_x: usize,
         offset_y: usize,
-        kerning: usize,
     ) {
         for (image_row, digit_row) in self.0[offset_y..].iter_mut().zip(&font[digit as usize]) {
-            for (image_pixel, digit_pixel) in
-                image_row[offset_x..].iter_mut().zip(&digit_row[kerning..])
-            {
+            for (image_pixel, digit_pixel) in image_row[offset_x..].iter_mut().zip(digit_row) {
                 *image_pixel = *digit_pixel;
             }
         }
