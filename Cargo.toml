@@ -24,7 +24,7 @@ esp-backtrace = { version = "0.14.2", features = [
     "esp32s3",
     "panic-handler",
     "exception-handler",
-    "println",
+    "defmt",
 ] }
 esp-hal = { version = "0.21.1", features = [
     "esp32s3",
@@ -35,7 +35,11 @@ esp-hal-embassy = { version = "0.4.0", features = [
     "executors",
     "esp32s3",
 ], default-features = false }
-esp-println = { version = "0.12.0", features = ["esp32s3", "log"] }
+esp-println = { version = "0.12.0", features = [
+    "esp32s3",
+    "log",
+    "defmt-espflash",
+] }
 esp-wifi = { version = "0.10.1", features = [
     "esp32s3",
     "async",
@@ -69,6 +73,7 @@ embedded-svc = { version = "0.28.0", default-features = false }
 
 byteorder = { version = "1.5.0", default-features = false }
 chrono = { version = "0.4.38", default-features = false }
+defmt = "0.3.8"
 heapless = "0.8.0"
 log = "0.4.22"
 micromath = "2.1.0"

@@ -44,7 +44,7 @@ const POSITIONS: [u8; COLS * ROWS] = [
 ];
 static mut FRAME_COUNTER: u32 = 0;
 
-#[derive(PartialEq, Eq, Clone, Default, Debug)]
+#[derive(PartialEq, Eq, Clone, Default, defmt::Format)]
 struct Quadruplet<T> {
     top_left: T,
     top_right: T,
@@ -65,7 +65,7 @@ impl<T> From<[T; 4]> for Quadruplet<T> {
     }
 }
 
-#[derive(Copy, Clone, Debug)]
+#[derive(Copy, Clone, defmt::Format)]
 pub(crate) struct RenderBuffer([[u8; COLS]; ROWS]);
 
 impl Default for RenderBuffer {

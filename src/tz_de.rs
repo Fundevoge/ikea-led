@@ -3,14 +3,14 @@ use core::fmt::{Debug, Display, Error, Formatter};
 
 use chrono::{FixedOffset, LocalResult, NaiveDate, NaiveDateTime, NaiveTime, Offset, TimeZone};
 
-#[derive(Debug, Clone, Copy)]
+#[derive(defmt::Format, Debug, Clone, Copy)]
 pub struct TzDe;
 
 /// An Offset that applies for a period of time
 ///
 /// For example, [`::US::Eastern`] is composed of at least two
 /// `FixedTimespan`s: `EST` and `EDT`, that are variously in effect.
-#[derive(Copy, Clone, PartialEq, Eq)]
+#[derive(Copy, Clone, PartialEq, Eq, Debug)]
 pub struct FixedTimespan {
     /// The base offset from UTC; this usually doesn't change unless the government changes something
     pub utc_offset: i32,
@@ -32,9 +32,9 @@ impl Display for FixedTimespan {
     }
 }
 
-impl Debug for FixedTimespan {
-    fn fmt(&self, f: &mut Formatter<'_>) -> Result<(), Error> {
-        write!(f, "{}", self.name)
+impl defmt::Format for FixedTimespan {
+    fn format(&self, fmt: defmt::Formatter) {
+        defmt::write!(fmt, "{}", self.name)
     }
 }
 
@@ -74,6 +74,12 @@ impl Display for TzOffset {
 impl Debug for TzOffset {
     fn fmt(&self, f: &mut Formatter<'_>) -> Result<(), Error> {
         Debug::fmt(&self.offset, f)
+    }
+}
+
+impl defmt::Format for TzOffset {
+    fn format(&self, fmt: defmt::Formatter) {
+        defmt::write!(fmt, "{}", &self.offset)
     }
 }
 

@@ -51,13 +51,13 @@ use static_cell::StaticCell;
 //     }};
 // }
 
-#[derive(Debug, PartialEq, Eq, Clone, Copy)]
+#[derive(defmt::Format, PartialEq, Eq, Clone, Copy)]
 enum ButtonPress {
     Short,
     Long,
 }
 
-#[derive(Debug, PartialEq, Eq, Clone, Copy)]
+#[derive(defmt::Format, PartialEq, Eq, Clone, Copy)]
 enum State {
     Stream,
     Clock(ClockType),
@@ -70,7 +70,7 @@ impl Default for State {
     }
 }
 
-#[derive(Debug, PartialEq, Eq, Clone, Copy)]
+#[derive(defmt::Format, PartialEq, Eq, Clone, Copy)]
 enum ClockType {
     Small,
     Large,
