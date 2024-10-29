@@ -42,13 +42,13 @@ pub const DIGITS_7_7: [[[u8; 7]; 7]; 10] = [
         [X, X, X, X, X, X, X],
     ],
     [
-        [O, X, X, X, X, X, O],
-        [O, O, O, O, O, X, X],
-        [O, O, O, O, O, X, X],
-        [O, O, X, X, X, X, O],
+        [X, X, X, X, X, X, O],
         [O, O, O, O, O, X, X],
         [O, O, O, O, O, X, X],
         [O, X, X, X, X, X, O],
+        [O, O, O, O, O, X, X],
+        [O, O, O, O, O, X, X],
+        [X, X, X, X, X, X, O],
     ],
     [
         [X, X, O, O, O, O, O],
