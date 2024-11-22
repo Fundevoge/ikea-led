@@ -6,6 +6,7 @@
 #![feature(slice_index_methods)]
 
 // mod exceptions;
+mod flag;
 mod network;
 mod patterns;
 mod render;
@@ -17,7 +18,7 @@ use esp_backtrace as _;
 use esp_hal::{
     cpu_control::{self, CpuControl},
     dma::Dma,
-    gpio::{self, GpioPin, Io},
+    gpio::{self, GpioPin},
     prelude::*,
     rng::Rng,
     rtc_cntl::Rtc,
@@ -25,7 +26,10 @@ use esp_hal::{
     timer::timg::TimerGroup,
 };
 use esp_hal_embassy::{self, Executor};
-use esp_wifi::wifi::{WifiDevice, WifiStaDevice};
+use esp_wifi::{
+    wifi::{WifiDevice, WifiStaDevice},
+    EspWifiController,
+};
 
 use embassy_net::{tcp::TcpSocket, Ipv4Address, Ipv4Cidr, StackResources, StaticConfigV4};
 use embassy_sync::{
@@ -39,17 +43,9 @@ use embedded_svc::io::asynch::Read;
 
 use heapless::Vec;
 
+use flag::Flag;
 use render::RenderBuffer;
 use static_cell::StaticCell;
-
-// macro_rules! mk_static {
-//     ($t:path,$val:expr) => {{
-//         static STATIC_CELL: static_cell::StaticCell<$t> = static_cell::StaticCell::new();
-//         #[deny(unused_attributes)]
-//         let x = STATIC_CELL.uninit().write(($val));
-//         x
-//     }};
-// }
 
 #[derive(defmt::Format, PartialEq, Eq, Clone, Copy)]
 enum ButtonPress {
@@ -94,22 +90,25 @@ impl State {
     }
 }
 
-static mut APP_CORE_STACK: cpu_control::Stack<8192> = cpu_control::Stack::new();
-static mut RENDER_BUF_1: RenderBuffer = RenderBuffer::empty();
-static mut RENDER_BUF_2: RenderBuffer = RenderBuffer::empty();
-
+// Inter task communication
+static WIFI_ENABLED_FLAG: StaticCell<Flag<NoopRawMutex>> = StaticCell::new();
+static RTC_OFFSET_FLAG: StaticCell<Flag<NoopRawMutex>> = StaticCell::new();
+static KEEPALIVE_ESTABLISHED_FLAG: StaticCell<Flag<NoopRawMutex>> = StaticCell::new();
+static BUTTON_SIGNAL: StaticCell<Signal<NoopRawMutex, ButtonPress>> = StaticCell::new();
 static mut RENDER_BUF_PTR_USED: Mutex<CriticalSectionRawMutex, *mut RenderBuffer> =
     Mutex::new(unsafe { addr_of_mut!(RENDER_BUF_1) });
 
-const RX_BUFFER_SIZE_STREAM: usize = 2048;
-const TX_BUFFER_SIZE_STREAM: usize = 64;
-static mut STREAM_RX_BUFFER: [u8; RX_BUFFER_SIZE_STREAM] = [0; RX_BUFFER_SIZE_STREAM];
-static mut STREAM_TX_BUFFER: [u8; TX_BUFFER_SIZE_STREAM] = [0; TX_BUFFER_SIZE_STREAM];
+// Static Resources
+static RTC: StaticCell<Rtc> = StaticCell::new();
+static WIFI_CONTROLLER: StaticCell<EspWifiController<'static>> = StaticCell::new();
+static WIFI_STACK_RESOURCES: StaticCell<StackResources<4>> = StaticCell::new();
+static WIFI_PROGRAM_STACK: StaticCell<embassy_net::Stack<WifiDevice<'static, WifiStaDevice>>> =
+    StaticCell::new();
+static mut APP_CORE_STACK: cpu_control::Stack<8192> = cpu_control::Stack::new();
 
-const RX_BUFFER_SIZE_CONTROL: usize = 1024;
-const TX_BUFFER_SIZE_CONTROL: usize = 64;
-static mut CONTROL_RX_BUFFER: [u8; RX_BUFFER_SIZE_CONTROL] = [0; RX_BUFFER_SIZE_CONTROL];
-static mut CONTROL_TX_BUFFER: [u8; TX_BUFFER_SIZE_CONTROL] = [0; TX_BUFFER_SIZE_CONTROL];
+// Shared mutable memory
+static mut RENDER_BUF_1: RenderBuffer = RenderBuffer::empty();
+static mut RENDER_BUF_2: RenderBuffer = RenderBuffer::empty();
 
 #[embassy_executor::task]
 async fn button_read_task(
@@ -140,6 +139,17 @@ async fn button_read_task(
     }
 }
 
+// Additional memory of main task to reduce stack size
+const RX_BUFFER_SIZE_STREAM: usize = 2048;
+const TX_BUFFER_SIZE_STREAM: usize = 64;
+static mut STREAM_RX_BUFFER: [u8; RX_BUFFER_SIZE_STREAM] = [0; RX_BUFFER_SIZE_STREAM];
+static mut STREAM_TX_BUFFER: [u8; TX_BUFFER_SIZE_STREAM] = [0; TX_BUFFER_SIZE_STREAM];
+
+const RX_BUFFER_SIZE_CONTROL: usize = 1024;
+const TX_BUFFER_SIZE_CONTROL: usize = 64;
+static mut CONTROL_RX_BUFFER: [u8; RX_BUFFER_SIZE_CONTROL] = [0; RX_BUFFER_SIZE_CONTROL];
+static mut CONTROL_TX_BUFFER: [u8; TX_BUFFER_SIZE_CONTROL] = [0; TX_BUFFER_SIZE_CONTROL];
+
 #[main]
 async fn main(spawner: embassy_executor::Spawner) -> ! {
     esp_println::logger::init_logger(log::LevelFilter::Info);
@@ -154,29 +164,28 @@ async fn main(spawner: embassy_executor::Spawner) -> ! {
     esp_alloc::heap_allocator!(72 * 1024);
 
     let timg0 = TimerGroup::new(peripherals.TIMG0);
-    esp_hal_embassy::init(timg0.timer0);
+    let timg1 = TimerGroup::new(peripherals.TIMG1);
 
-    let io = Io::new(peripherals.GPIO, peripherals.IO_MUX);
+    esp_hal_embassy::init(timg1.timer0);
+
     log::info!("Hello world!");
 
-    let mut screen_override = gpio::Output::new(io.pins.gpio2, gpio::Level::Low);
+    let mut screen_override = gpio::Output::new(peripherals.GPIO2, gpio::Level::Low);
 
-    static RTC: StaticCell<Rtc> = StaticCell::new();
     let rtc: &'static Rtc = RTC.init(Rtc::new(peripherals.LPWR));
 
-    let wifi_timer = TimerGroup::new(peripherals.TIMG1).timer0;
-
-    let wifi_init = esp_wifi::init(
-        esp_wifi::EspWifiInitFor::Wifi,
-        wifi_timer,
-        Rng::new(peripherals.RNG),
-        peripherals.RADIO_CLK,
-    )
-    .unwrap();
+    let wifi_controller: &'static EspWifiController<'static> = WIFI_CONTROLLER.uninit().write(
+        esp_wifi::init(
+            timg0.timer0,
+            Rng::new(peripherals.RNG),
+            peripherals.RADIO_CLK,
+        )
+        .unwrap(),
+    );
 
     let wifi = peripherals.WIFI;
     let (wifi_interface, wifi_controller) =
-        esp_wifi::wifi::new_with_mode(&wifi_init, wifi, WifiStaDevice).unwrap();
+        esp_wifi::wifi::new_with_mode(wifi_controller, wifi, WifiStaDevice).unwrap();
 
     let dns_servers = Vec::from_slice(&[
         Ipv4Address([192, 168, 178, 30]),
@@ -191,11 +200,9 @@ async fn main(spawner: embassy_executor::Spawner) -> ! {
     });
     let seed = 666722646956068949;
 
-    static WIFI_STACK_RESOURCES: StaticCell<StackResources<4>> = StaticCell::new();
     let wifi_stack_resources: &'static mut StackResources<4> =
         &mut *WIFI_STACK_RESOURCES.init(StackResources::<4>::new());
-    static WIFI_PROGRAM_STACK: StaticCell<embassy_net::Stack<WifiDevice<'static, WifiStaDevice>>> =
-        StaticCell::new();
+
     let wifi_program_stack: &'static embassy_net::Stack<WifiDevice<'_, WifiStaDevice>> =
         &*WIFI_PROGRAM_STACK.init(embassy_net::Stack::new(
             wifi_interface,
@@ -208,39 +215,36 @@ async fn main(spawner: embassy_executor::Spawner) -> ! {
         .spawn(network::net_task(wifi_program_stack))
         .unwrap();
 
-    static WIFI_ENABLED_SIGNAL: StaticCell<Signal<NoopRawMutex, ()>> = StaticCell::new();
-    let wifi_enabled_signal: &'static Signal<NoopRawMutex, ()> =
-        &*WIFI_ENABLED_SIGNAL.init(Signal::new());
+    let wifi_enabled_flag: &'static Flag<NoopRawMutex> = &*WIFI_ENABLED_FLAG.init(Flag::new());
 
     spawner
-        .spawn(network::connection(wifi_controller, wifi_enabled_signal))
+        .spawn(network::connection(wifi_controller, wifi_enabled_flag))
         .unwrap();
-    wifi_enabled_signal.wait().await;
+    wifi_enabled_flag.wait_peek().await;
 
-    static KEEPALIVE_ESTABLISHED_SIGNAL: StaticCell<Signal<NoopRawMutex, ()>> = StaticCell::new();
-    let keepalive_established_signal: &'static Signal<NoopRawMutex, ()> =
-        &*KEEPALIVE_ESTABLISHED_SIGNAL.init(Signal::new());
+    let keepalive_established_flag: &'static Flag<NoopRawMutex> =
+        &*KEEPALIVE_ESTABLISHED_FLAG.init(Flag::new());
 
     spawner
         .spawn(network::keep_alive(
             wifi_program_stack,
-            keepalive_established_signal,
+            keepalive_established_flag,
+            wifi_enabled_flag,
         ))
         .unwrap();
-    keepalive_established_signal.wait().await;
+    keepalive_established_flag.wait_peek().await;
 
-    static RTC_OFFSET_SIGNAL: StaticCell<Signal<NoopRawMutex, ()>> = StaticCell::new();
-    let rtc_offset_signal: &'static Signal<NoopRawMutex, ()> =
-        &*RTC_OFFSET_SIGNAL.init(Signal::new());
+    let rtc_offset_flag: &'static Flag<NoopRawMutex> = &*RTC_OFFSET_FLAG.init(Flag::new());
 
     spawner
         .spawn(rtc::rtc_adjust_task(
             wifi_program_stack,
             rtc,
-            rtc_offset_signal,
+            rtc_offset_flag,
+            wifi_enabled_flag,
         ))
         .unwrap();
-    rtc_offset_signal.wait().await;
+    rtc_offset_flag.wait_peek().await;
 
     let mut control_socket = TcpSocket::new(
         wifi_program_stack,
@@ -262,13 +266,27 @@ async fn main(spawner: embassy_executor::Spawner) -> ! {
         unsafe { &mut *addr_of_mut!(STREAM_TX_BUFFER) },
     );
 
-    let sclk = io.pins.gpio40;
-    let miso = io.pins.gpio26;
-    let mosi = io.pins.gpio41;
-    let cs = io.pins.gpio42;
-    let spi = Spi::new(peripherals.SPI2, 4.MHz(), SpiMode::Mode0).with_pins(sclk, mosi, miso, cs);
+    let sclk = peripherals.GPIO40;
+    let miso = peripherals.GPIO26;
+    let mosi = peripherals.GPIO41;
+    let cs = peripherals.GPIO42;
     let dma = Dma::new(peripherals.DMA);
     let dma_channel = dma.channel0;
+
+    let spi: Spi<'static, esp_hal::Async> = Spi::new_with_config(
+        peripherals.SPI2,
+        esp_hal::spi::master::Config {
+            frequency: 4.MHz(),
+            mode: SpiMode::Mode0,
+            ..esp_hal::spi::master::Config::default()
+        },
+    )
+    .with_sck(sclk)
+    .with_mosi(mosi)
+    .with_miso(miso)
+    .with_cs(cs)
+    .into_async();
+
     let cpu1_fnctn = move || {
         static EXECUTOR: StaticCell<Executor> = StaticCell::new();
         let executor: &'static mut Executor = &mut *EXECUTOR.init(Executor::new());
@@ -281,9 +299,8 @@ async fn main(spawner: embassy_executor::Spawner) -> ! {
         .unwrap();
     log::info!("Started Spi renderer!");
 
-    let btn = gpio::Input::new_typed(io.pins.gpio1, gpio::Pull::Up);
+    let btn = gpio::Input::new_typed(peripherals.GPIO1, gpio::Pull::Up);
 
-    static BUTTON_SIGNAL: StaticCell<Signal<NoopRawMutex, ButtonPress>> = StaticCell::new();
     let button_signal: &'static Signal<NoopRawMutex, ButtonPress> =
         &*BUTTON_SIGNAL.init(Signal::new());
 
@@ -358,8 +375,8 @@ async fn main(spawner: embassy_executor::Spawner) -> ! {
                     .unwrap();
             }
             State::Clock(clock_type) => {
-                if rtc_offset_signal.signaled() {
-                    rtc_offset_signal.wait().await;
+                if rtc_offset_flag.flagged() {
+                    rtc_offset_flag.wait_take().await;
                 }
                 let time = rtc::get_german_datetime(rtc);
 
