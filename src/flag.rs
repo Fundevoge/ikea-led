@@ -111,18 +111,18 @@ where
     }
 
     /// non-blocking method to try and take the flag.
-    pub fn try_take(&self) -> Option<()> {
-        self.state.lock(|cell| {
-            let state = cell.replace(State::None);
-            match state {
-                State::Flagged => Some(()),
-                state => {
-                    cell.set(state);
-                    None
-                }
-            }
-        })
-    }
+    // pub fn try_take(&self) -> Option<()> {
+    //     self.state.lock(|cell| {
+    //         let state = cell.replace(State::None);
+    //         match state {
+    //             State::Flagged => Some(()),
+    //             state => {
+    //                 cell.set(state);
+    //                 None
+    //             }
+    //         }
+    //     })
+    // }
 
     fn poll_wait_peek(&self, cx: &mut Context<'_>) -> Poll<()> {
         self.state.lock(|cell| {

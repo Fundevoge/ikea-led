@@ -19,17 +19,18 @@ inherits = "release"
 debug = true
 
 [dependencies]
-esp-alloc = "0.5.0"
 esp-backtrace = { version = "0.14.2", features = [
     "esp32s3",
     "panic-handler",
     "exception-handler",
     "defmt",
-] }
+    "custom-halt",
+] } # , path = "C:\\Programmieren\\rust_embedded\\esp32-s3-wroom-1\\dependencies\\esp-backtrace-0.14.2" 
+
+esp-alloc = "0.5.0"
 esp-hal = { version = "0.22.0", features = [
     "esp32s3",
     "log",
-    #    "debug",
 ], default-features = false }
 esp-hal-embassy = { version = "0.5.0", features = [
     "executors",
@@ -39,17 +40,10 @@ esp-println = { version = "0.12.0", features = [
     "esp32s3",
     "log",
     "defmt-espflash",
-] }
+] } # path = "C:\\Programmieren\\rust_embedded\\esp32-s3-wroom-1\\dependencies\\esp-println-0.12.0",
 esp-wifi = { version = "0.11.0", features = [
     "esp32s3",
-    # "async",
-    # "embassy-net",
     "log",
-    # "ipv4",
-    # "tcp",
-    # "icmp",
-    # "igmp",
-    # "dhcpv4",
     "wifi",
     "utils",
 ] }
@@ -57,7 +51,7 @@ esp-wifi = { version = "0.11.0", features = [
 
 embassy-time = { version = "0.3.2", features = ["generic-queue-8"] }
 embassy-executor = { version = "0.6.3", features = ["task-arena-size-65536"] }
-embassy-sync = "0.6.0"
+embassy-sync = "0.6.1"
 embassy-net = { version = "0.4.0", features = [
     "medium-ethernet",
     "medium-ip",
@@ -69,6 +63,7 @@ embassy-net = { version = "0.4.0", features = [
 
 embedded-hal-async = "1.0.0"
 embedded-svc = { version = "0.28.0", default-features = false }
+embedded-sdmmc = { version = "0.6.0" }                          # maybe 0.8.1 if the correct spi trait is implemented
 
 
 byteorder = { version = "1.5.0", default-features = false }

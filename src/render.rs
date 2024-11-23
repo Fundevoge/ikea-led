@@ -233,8 +233,8 @@ pub(crate) async fn render_loop(
     let mut min_brightness = 0_u16;
     static mut PIXEL_BITS_BUFFER_1: [u8; ROWS * COLS / 8] = [0_u8; ROWS * COLS / 8];
     static mut PIXEL_BITS_BUFFER_2: [u8; ROWS * COLS / 8] = [0_u8; ROWS * COLS / 8];
-    let mut pixel_bits_buffer_writable = unsafe { addr_of_mut!(PIXEL_BITS_BUFFER_1) };
-    let mut pixel_bits_buffer_in_transfer = unsafe { addr_of_mut!(PIXEL_BITS_BUFFER_2) };
+    let mut pixel_bits_buffer_writable = addr_of_mut!(PIXEL_BITS_BUFFER_1);
+    let mut pixel_bits_buffer_in_transfer = addr_of_mut!(PIXEL_BITS_BUFFER_2);
     let mut ticker = Ticker::every(Duration::from_micros(RENDER_LOOP_DURATION_MICROS));
 
     loop {

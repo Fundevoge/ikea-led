@@ -5,12 +5,13 @@
 #![feature(asm_experimental_arch)]
 #![feature(slice_index_methods)]
 
-// mod exceptions;
 mod flag;
 mod network;
+mod panic_reboot;
 mod patterns;
 mod render;
 mod rtc;
+mod sd_logger;
 mod tz_de;
 
 use core::ptr::addr_of_mut;
@@ -96,7 +97,7 @@ static RTC_OFFSET_FLAG: StaticCell<Flag<NoopRawMutex>> = StaticCell::new();
 static KEEPALIVE_ESTABLISHED_FLAG: StaticCell<Flag<NoopRawMutex>> = StaticCell::new();
 static BUTTON_SIGNAL: StaticCell<Signal<NoopRawMutex, ButtonPress>> = StaticCell::new();
 static mut RENDER_BUF_PTR_USED: Mutex<CriticalSectionRawMutex, *mut RenderBuffer> =
-    Mutex::new(unsafe { addr_of_mut!(RENDER_BUF_1) });
+    Mutex::new(addr_of_mut!(RENDER_BUF_1));
 
 // Static Resources
 static RTC: StaticCell<Rtc> = StaticCell::new();
