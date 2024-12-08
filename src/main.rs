@@ -4,6 +4,7 @@
 #![feature(const_slice_from_raw_parts_mut)]
 #![feature(asm_experimental_arch)]
 #![feature(slice_index_methods)]
+#![feature(ascii_char)]
 
 mod flag;
 mod network;
@@ -19,7 +20,7 @@ use esp_backtrace as _;
 use esp_hal::{
     cpu_control::{self, CpuControl},
     dma::Dma,
-    gpio::{self, GpioPin},
+    gpio::{self, GpioPin, Output},
     prelude::*,
     rng::Rng,
     rtc_cntl::Rtc,
@@ -101,11 +102,13 @@ static mut RENDER_BUF_PTR_USED: Mutex<CriticalSectionRawMutex, *mut RenderBuffer
 
 // Static Resources
 static RTC: StaticCell<Rtc> = StaticCell::new();
+static mut RTC2: Option<&'static Rtc> = None;
 static WIFI_CONTROLLER: StaticCell<EspWifiController<'static>> = StaticCell::new();
 static WIFI_STACK_RESOURCES: StaticCell<StackResources<4>> = StaticCell::new();
 static WIFI_PROGRAM_STACK: StaticCell<embassy_net::Stack<WifiDevice<'static, WifiStaDevice>>> =
     StaticCell::new();
 static mut APP_CORE_STACK: cpu_control::Stack<8192> = cpu_control::Stack::new();
+static CPU1_EXECUTOR: StaticCell<Executor> = StaticCell::new();
 
 // Shared mutable memory
 static mut RENDER_BUF_1: RenderBuffer = RenderBuffer::empty();
@@ -153,38 +156,72 @@ static mut CONTROL_TX_BUFFER: [u8; TX_BUFFER_SIZE_CONTROL] = [0; TX_BUFFER_SIZE_
 
 #[main]
 async fn main(spawner: embassy_executor::Spawner) -> ! {
-    esp_println::logger::init_logger(log::LevelFilter::Info);
-
     let peripherals = esp_hal::init({
         let mut config = esp_hal::Config::default();
         config.cpu_clock = CpuClock::max();
         config
     });
+
+    let dma = Dma::new(peripherals.DMA);
     let mut cpu_control = CpuControl::new(peripherals.CPU_CTRL);
+    let rng = Rng::new(peripherals.RNG);
+
+    let rtc: &'static Rtc = RTC.init(Rtc::new(peripherals.LPWR));
+    unsafe { RTC2 = Some(rtc) };
+
+    let wifi = peripherals.WIFI;
+    let radio_clk = peripherals.RADIO_CLK;
+    let timg_peripheral_wifi = peripherals.TIMG0;
+    let timg_peripheral_embassy = peripherals.TIMG1;
+
+    let screen_override_pin = peripherals.GPIO2;
+    let button_pin = peripherals.GPIO1;
+
+    let sclk_sd = peripherals.GPIO35;
+    let miso_sd = peripherals.GPIO36;
+    let mosi_sd = peripherals.GPIO37;
+    let cs_sd = peripherals.GPIO38;
+
+    let sclk_display = peripherals.GPIO40;
+    let _miso_display = peripherals.GPIO26;
+    let mosi_display = peripherals.GPIO41;
+    let cs_display = peripherals.GPIO42;
+
+    let dma_channel_display = dma.channel0;
+
+    let spi_peripheral_sd = peripherals.SPI3;
+    let spi_peripheral_display = peripherals.SPI2;
+
+    let spi_sd: Spi<'static, esp_hal::Blocking> = Spi::new_with_config(
+        spi_peripheral_sd,
+        esp_hal::spi::master::Config {
+            frequency: 4.MHz(),
+            mode: SpiMode::Mode0,
+            ..esp_hal::spi::master::Config::default()
+        },
+    )
+    .with_sck(sclk_sd)
+    .with_mosi(mosi_sd)
+    .with_miso(miso_sd);
+    let cs_pin_sd = Output::new(cs_sd, gpio::Level::High);
+    sd_logger::init_logger(log::LevelFilter::Info, spi_sd, cs_pin_sd);
+
+    // esp_println::logger::init_logger(log::LevelFilter::Info);
 
     esp_alloc::heap_allocator!(72 * 1024);
 
-    let timg0 = TimerGroup::new(peripherals.TIMG0);
-    let timg1 = TimerGroup::new(peripherals.TIMG1);
+    let timg_wifi = TimerGroup::new(timg_peripheral_wifi);
+    let timg_embassy = TimerGroup::new(timg_peripheral_embassy);
 
-    esp_hal_embassy::init(timg1.timer0);
+    esp_hal_embassy::init(timg_embassy.timer0);
 
     log::info!("Hello world!");
 
-    let mut screen_override = gpio::Output::new(peripherals.GPIO2, gpio::Level::Low);
+    let mut screen_override = gpio::Output::new(screen_override_pin, gpio::Level::Low);
 
-    let rtc: &'static Rtc = RTC.init(Rtc::new(peripherals.LPWR));
+    let wifi_controller: &'static EspWifiController<'static> =
+        WIFI_CONTROLLER.init(esp_wifi::init(timg_wifi.timer0, rng, radio_clk).unwrap());
 
-    let wifi_controller: &'static EspWifiController<'static> = WIFI_CONTROLLER.uninit().write(
-        esp_wifi::init(
-            timg0.timer0,
-            Rng::new(peripherals.RNG),
-            peripherals.RADIO_CLK,
-        )
-        .unwrap(),
-    );
-
-    let wifi = peripherals.WIFI;
     let (wifi_interface, wifi_controller) =
         esp_wifi::wifi::new_with_mode(wifi_controller, wifi, WifiStaDevice).unwrap();
 
@@ -267,32 +304,26 @@ async fn main(spawner: embassy_executor::Spawner) -> ! {
         unsafe { &mut *addr_of_mut!(STREAM_TX_BUFFER) },
     );
 
-    let sclk = peripherals.GPIO40;
-    let miso = peripherals.GPIO26;
-    let mosi = peripherals.GPIO41;
-    let cs = peripherals.GPIO42;
-    let dma = Dma::new(peripherals.DMA);
-    let dma_channel = dma.channel0;
-
     let spi: Spi<'static, esp_hal::Async> = Spi::new_with_config(
-        peripherals.SPI2,
+        spi_peripheral_display,
         esp_hal::spi::master::Config {
             frequency: 4.MHz(),
             mode: SpiMode::Mode0,
             ..esp_hal::spi::master::Config::default()
         },
     )
-    .with_sck(sclk)
-    .with_mosi(mosi)
-    .with_miso(miso)
-    .with_cs(cs)
+    .with_sck(sclk_display)
+    .with_mosi(mosi_display)
+    .with_miso(_miso_display)
+    .with_cs(cs_display)
     .into_async();
 
     let cpu1_fnctn = move || {
-        static EXECUTOR: StaticCell<Executor> = StaticCell::new();
-        let executor: &'static mut Executor = &mut *EXECUTOR.init(Executor::new());
+        let executor: &'static mut Executor = &mut *CPU1_EXECUTOR.init(Executor::new());
         executor.run(|spawner| {
-            spawner.spawn(render::render_loop(spi, dma_channel)).ok();
+            spawner
+                .spawn(render::render_loop(spi, dma_channel_display))
+                .ok();
         });
     };
     let _guard = cpu_control
@@ -300,12 +331,14 @@ async fn main(spawner: embassy_executor::Spawner) -> ! {
         .unwrap();
     log::info!("Started Spi renderer!");
 
-    let btn = gpio::Input::new_typed(peripherals.GPIO1, gpio::Pull::Up);
+    let button_input = gpio::Input::new_typed(button_pin, gpio::Pull::Up);
 
     let button_signal: &'static Signal<NoopRawMutex, ButtonPress> =
         &*BUTTON_SIGNAL.init(Signal::new());
 
-    spawner.spawn(button_read_task(btn, button_signal)).unwrap();
+    spawner
+        .spawn(button_read_task(button_input, button_signal))
+        .unwrap();
 
     let mut editable_render_buf = unsafe { &mut *addr_of_mut!(RENDER_BUF_2) };
 

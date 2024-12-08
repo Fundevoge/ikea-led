@@ -1,200 +1,229 @@
-// use cortex_m::interrupt::{self, Mutex};
-// use embedded_sdmmc::{SdCard, TimeSource, Timestamp, VolumeManager};
-// use panic_halt as _;
-// use stm32f3xx_hal::{delay::Delay, pac, prelude::*, rcc::RccExt, spi::Spi};
+use core::fmt::{Debug, Write};
 
-// use core::{
-//     cell::RefCell,
-//     fmt::{Debug, Write},
-// };
+use crate::{tz_de::TzDe, RTC2 as RTC_REF};
+use chrono::{Datelike, TimeZone as _, Timelike};
+use embedded_sdmmc::{File, SdCard, TimeSource, Timestamp, VolumeManager};
+use esp_hal::{delay::Delay, gpio::Output, spi::master::Spi};
+use esp_println::println;
+use heapless::String;
+struct Clock;
 
-// use cortex_m_rt::entry;
-// use cortex_m_semihosting::hio;
-// struct Clock;
+impl TimeSource for Clock {
+    fn get_timestamp(&self) -> Timestamp {
+        let current_time = unsafe { RTC_REF.unwrap() }.current_time();
+        Timestamp {
+            year_since_1970: (current_time.year() - 1970) as u8,
+            zero_indexed_month: current_time.month0() as u8,
+            zero_indexed_day: current_time.day0() as u8,
+            hours: current_time.hour() as u8,
+            minutes: current_time.minute() as u8,
+            seconds: current_time.second() as u8,
+        }
+    }
+}
 
-// impl TimeSource for Clock {
-//     fn get_timestamp(&self) -> Timestamp {
-//         Timestamp {
-//             year_since_1970: 0,
-//             zero_indexed_month: 0,
-//             zero_indexed_day: 0,
-//             hours: 0,
-//             minutes: 0,
-//             seconds: 0,
-//         }
+pub(crate) fn is_enabled(_level: log::Level, _target: &str) -> bool {
+    true
+}
+
+type VolumeMgr =
+    VolumeManager<SdCard<Spi<'static, esp_hal::Blocking>, Output<'static>, Delay>, Clock>;
+static mut SD_LOGGER_VOLUME_MANAGER: Option<VolumeMgr> = None;
+static mut LOG_FILE_NAME: String<12> = String::new();
+
+/// Initialize the logger with the given maximum log level.
+pub fn init_logger(
+    level: log::LevelFilter,
+    spi: Spi<'static, esp_hal::Blocking>,
+    cs: Output<'static>,
+) {
+    let sdcard = SdCard::new(spi, cs, Delay::new());
+    let mut volume_mgr = VolumeManager::new(sdcard, Clock);
+
+    let volume0 = volume_mgr
+        .open_volume(embedded_sdmmc::VolumeIdx(0))
+        .my_expect("Failed to open volume 0");
+    let root_dir = volume_mgr
+        .open_root_dir(volume0)
+        .my_expect("Failed to open root directory");
+    let mut max_file_num: u32 = 0;
+    volume_mgr
+        .iterate_dir(root_dir, |entry| {
+            if !entry.attributes.is_directory()
+                || entry.attributes.is_hidden()
+                || entry.attributes.is_read_only()
+                || entry.attributes.is_system()
+                || entry.attributes.is_volume()
+                || !entry
+                    .name
+                    .base_name()
+                    .iter()
+                    .all(|b| b'0' <= *b && *b <= b'9')
+            {
+                return;
+            }
+
+            let num = entry
+                .name
+                .base_name()
+                .as_ascii()
+                .my_expect("File name should be ascii")
+                .as_str()
+                .parse::<u32>()
+                .my_expect("File name should be parseable number");
+            max_file_num = max_file_num.max(num);
+        })
+        .my_expect("Failed to iterate through directory");
+
+    let mut log_file_name = heapless::String::<12>::new(); // 32 byte string buffer
+
+    write!(log_file_name, "{}", max_file_num + 1)
+        .my_expect("New file name should fit into 12 bytes");
+
+    let log_file = volume_mgr
+        .open_file_in_dir(
+            root_dir,
+            log_file_name.as_str(),
+            embedded_sdmmc::Mode::ReadWriteCreateOrAppend,
+        )
+        .my_expect("Failed to open or create log file");
+
+    volume_mgr
+        .write(log_file, b"BEGIN OF LOG\r\n")
+        .my_expect("Failed to write to log file initially");
+
+    volume_mgr
+        .close_file(log_file)
+        .my_expect("Failed to close file");
+    volume_mgr
+        .close_dir(root_dir)
+        .my_expect("Failed to root directory");
+    volume_mgr
+        .close_volume(volume0)
+        .my_expect("Failed to close volume");
+
+    unsafe {
+        SD_LOGGER_VOLUME_MANAGER = Some(volume_mgr);
+        LOG_FILE_NAME = log_file_name;
+        log::set_logger_racy(&SdLogger).unwrap();
+        log::set_max_level_racy(level);
+    }
+}
+
+// pub(crate) const FILTER_MAX: log::LevelFilter = log::LevelFilter::Off;
+// /// Initialize the logger from the `ESP_LOG` environment variable.
+// pub fn init_logger_from_env(spi: Spi<'static, esp_hal::Async>) {
+//     let sd_logger: &'static SdLogger = SD_LOGGER_SPI.init(SdLogger { spi });
+//     unsafe {
+//         log::set_logger_racy(sd_logger).unwrap();
+//         log::set_max_level_racy(FILTER_MAX);
 //     }
 // }
 
-// static mut HSTDOUT: Option<hio::HostStream> = None;
+// Example SPI wrapper
+pub struct SdFileWriter<'a> {
+    volume_mgr: &'a mut VolumeMgr,
+    log_file: File,
+}
 
-// macro_rules! println {
-//     ($($t:tt)*) => {
-//         unsafe {
-//             if let Some(console) = HSTDOUT.as_mut() {
-//                 let _ = writeln!(console, $($t)*);
-//             }
-//         }
-//     };
-// }
+// Implement the Write trait for the wrapper
+impl<'a> Write for SdFileWriter<'a> {
+    fn write_str(&mut self, s: &str) -> core::fmt::Result {
+        self.volume_mgr
+            .write(self.log_file, s.as_bytes())
+            .map(|_| ())
+            .map_err(|_| core::fmt::Error)
+    }
+}
 
-// macro_rules! print {
-//     ($($t:tt)*) => {
-//         unsafe {
-//             if let Some(console) = HSTDOUT.as_mut() {
-//                 let _ = write!(console, $($t)*);
-//             }
-//         }
-//     };
-// }
+struct SdLogger;
 
-// // Define the trait
-// pub trait MyExpect<T> {
-//     fn my_expect(self, msg: &str) -> T;
-// }
+impl log::Log for SdLogger {
+    fn enabled(&self, metadata: &log::Metadata) -> bool {
+        let level = metadata.level();
+        let target = metadata.target();
+        is_enabled(level, target)
+    }
 
-// // Implement the trait for Result
-// impl<T, E: Debug> MyExpect<T> for Result<T, E> {
-//     fn my_expect(self, msg: &str) -> T {
-//         match self {
-//             Ok(val) => val,
-//             Err(err) => {
-//                 println!("{}: {:?}", msg, err);
-//                 panic!("{}: {:?}", msg, err);
-//             }
-//         }
-//     }
-// }
+    #[allow(unused)]
+    fn log(&self, record: &log::Record) {
+        if !self.enabled(record.metadata()) {
+            return;
+        }
 
-// // Implement the trait for Result
-// impl<T> MyExpect<T> for Option<T> {
-//     fn my_expect(self, msg: &str) -> T {
-//         match self {
-//             Some(val) => val,
-//             None => {
-//                 println!("{}", msg);
-//                 panic!("{}", msg);
-//             }
-//         }
-//     }
-// }
+        let current_time = TzDe.from_utc_datetime(&unsafe { RTC_REF.unwrap() }.current_time());
 
-// #[entry]
-// fn main() -> ! {
-//     let hstdout = hio::hstdout().my_expect("Failed to initialize host stdout");
-//     unsafe { HSTDOUT = Some(hstdout) };
-//     println!("Hello World!");
+        println!("{} - {} - {}", record.level(), current_time, record.args());
 
-//     let p = cortex_m::Peripherals::take().my_expect("Failed to take Cortex-M peripherals");
-//     let dp = pac::Peripherals::take().my_expect("Failed to take device peripherals");
-//     let mut flash = dp.FLASH.constrain();
-//     let mut rcc = dp.RCC.constrain();
-//     let mut gpioa = dp.GPIOA.split(&mut rcc.ahb);
-//     let mut gpiob = dp.GPIOB.split(&mut rcc.ahb);
+        // Safety: Only used on one core
+        let mut volume_mgr = unsafe { SD_LOGGER_VOLUME_MANAGER.as_mut().unwrap() };
+        let volume0 = volume_mgr
+            .open_volume(embedded_sdmmc::VolumeIdx(0))
+            .my_expect("Failed to open volume 0");
+        let root_dir = volume_mgr
+            .open_root_dir(volume0)
+            .my_expect("Failed to open root directory");
 
-//     let clocks = rcc
-//         .cfgr
-//         .use_hse(8.MHz())
-//         .sysclk(48.MHz())
-//         .pclk1(24.MHz())
-//         .freeze(&mut flash.acr);
+        let log_file = volume_mgr
+            .open_file_in_dir(
+                root_dir,
+                unsafe { LOG_FILE_NAME.as_str() },
+                embedded_sdmmc::Mode::ReadWriteAppend,
+            )
+            .my_expect("Failed to open log file");
 
-//     // Configure pins for SPI
-//     let sck = gpioa
-//         .pa5
-//         .into_af_push_pull(&mut gpioa.moder, &mut gpioa.otyper, &mut gpioa.afrl);
-//     let miso = gpioa
-//         .pa6
-//         .into_af_push_pull(&mut gpioa.moder, &mut gpioa.otyper, &mut gpioa.afrl);
-//     let mosi = gpioa
-//         .pa7
-//         .into_af_push_pull(&mut gpioa.moder, &mut gpioa.otyper, &mut gpioa.afrl);
+        writeln!(
+            SdFileWriter {
+                volume_mgr,
+                log_file
+            },
+            "{} - {} - {}",
+            record.level(),
+            current_time,
+            record.args()
+        );
 
-//     let spi = Spi::new(dp.SPI1, (sck, miso, mosi), 4.MHz(), clocks, &mut rcc.apb2);
+        volume_mgr
+            .close_file(log_file)
+            .my_expect("Failed to close file");
+        volume_mgr
+            .close_dir(root_dir)
+            .my_expect("Failed to root directory");
+        volume_mgr
+            .close_volume(volume0)
+            .my_expect("Failed to close volume");
+    }
 
-//     // Build an SD Card interface out of an SPI device, a chip-select pin and a delay object
-//     let sdcard = SdCard::new(
-//         spi,
-//         gpiob
-//             .pb6
-//             .into_push_pull_output(&mut gpiob.moder, &mut gpiob.otyper),
-//         Delay::new(p.SYST, clocks),
-//     );
-//     println!("INIT SD CARD!");
-//     let mut volume_mgr = VolumeManager::new(sdcard, Clock);
-//     println!(
-//         "Card size is {} bytes",
-//         volume_mgr
-//             .device()
-//             .num_bytes()
-//             .my_expect("Failed to get card size")
-//     );
-//     let volume0 = volume_mgr
-//         .open_volume(embedded_sdmmc::VolumeIdx(0))
-//         .my_expect("Failed to open volume 0");
-//     println!("Volume 0: {:?}", volume0);
-//     // Open the root directory (passing in the volume we're using).
-//     let root_dir = volume_mgr
-//         .open_root_dir(volume0)
-//         .my_expect("Failed to open root directory");
-//     let my_file = volume_mgr
-//         .open_file_in_dir(
-//             root_dir,
-//             "0",
-//             embedded_sdmmc::Mode::ReadWriteCreateOrTruncate,
-//         )
-//         .my_expect("Failed to open or create file '0'");
-//     volume_mgr
-//         .write(my_file, b"Hello, this is a new file on disk\r\n")
-//         .my_expect("Failed to write to file");
-//     volume_mgr
-//         .close_file(my_file)
-//         .my_expect("Failed to close the file");
+    fn flush(&self) {}
+}
 
-//     println!("Listing /");
-//     let mut max_file_num = -1;
-//     volume_mgr
-//         .iterate_dir(root_dir, |entry| {
-//             if entry.attributes.is_directory()
-//                 || entry.attributes.is_hidden()
-//                 || entry.attributes.is_read_only()
-//                 || entry.attributes.is_system()
-//                 || entry.attributes.is_volume()
-//             {
-//                 return;
-//             }
-//             print!("{:12} {:9} {}", entry.name, entry.size, entry.mtime,);
-//             if entry.attributes.is_archive() {
-//                 print!("<ARC>");
-//             }
-//             if entry.attributes.is_lfn() {
-//                 print!("<LFF>");
-//             }
-//             println!();
-//             if !entry
-//                 .name
-//                 .base_name()
-//                 .iter()
-//                 .all(|b| b'0' <= *b && *b <= b'9')
-//             {
-//                 return;
-//             }
-//             let num = entry
-//                 .name
-//                 .base_name()
-//                 .as_ascii()
-//                 .expect("File name should be ascii")
-//                 .as_str()
-//                 .parse::<i32>()
-//                 .expect("Number should be parseable");
-//             println!("Number {num}");
-//             max_file_num = max_file_num.max(num);
-//         })
-//         .my_expect("Failed to iterate through directory");
-//     println!("Highest file number: {max_file_num}");
+// Define the trait
+pub trait MyExpect<T> {
+    fn my_expect(self, msg: &str) -> T;
+}
 
-//     volume_mgr
-//         .close_dir(root_dir)
-//         .my_expect("Failed to close root directory");
+// Implement the trait for Result
+impl<T, E: Debug> MyExpect<T> for Result<T, E> {
+    fn my_expect(self, msg: &str) -> T {
+        match self {
+            Ok(val) => val,
+            Err(err) => {
+                println!("{}: {:?}", msg, err);
+                panic!("{}: {:?}", msg, err);
+            }
+        }
+    }
+}
 
-//     panic!()
-// }
+// Implement the trait for Result
+impl<T> MyExpect<T> for Option<T> {
+    fn my_expect(self, msg: &str) -> T {
+        match self {
+            Some(val) => val,
+            None => {
+                println!("{}", msg);
+                panic!("{}", msg);
+            }
+        }
+    }
+}

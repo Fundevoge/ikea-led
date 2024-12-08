@@ -220,6 +220,9 @@ impl RenderBuffer {
     }
 }
 
+////////////// WARNING ////////////////////
+/// Do not call log from this task as it runs on a different core
+/// Also it should ONLY render without interruptions
 const RENDER_LOOP_DURATION_MICROS: u64 = 50;
 #[embassy_executor::task]
 pub(crate) async fn render_loop(

@@ -42,18 +42,22 @@ pub(crate) async fn rtc_adjust_task(
     );
     // time_socket.set_timeout(Some(embassy_time::Duration::from_secs(10)));
     let endpoint = (Ipv4Address::new(192, 168, 178, 30), 3125);
-    if let Err(time_connection_error) = time_socket.connect(endpoint).await {
-        log::warn!("Connection error: {time_connection_error:?}");
-    } else {
-        log::info!("Time Control Connected!");
+
+    while let Err(e) = time_socket.connect(endpoint).await {
+        log::warn!("[Rtc Offset] Initial connection failed, retrying. {e:?}");
+        Timer::after_secs(10).await;
     }
 
     let mut unix_time_buffer = [0_u8; 8];
     time_socket.read_exact(&mut unix_time_buffer).await.unwrap();
     set_rtc_offset(rtc, u64::from_le_bytes(unix_time_buffer));
+    log::info!("[Rtc Offset] Initially connected!");
     rtc_offset_flag.flag();
 
     loop {
+        // Yield control immediately
+        Timer::after_secs(1).await;
+        // Wait for message
         match time_socket.read_exact(&mut unix_time_buffer).await {
             Ok(()) => {
                 set_rtc_offset(rtc, u64::from_le_bytes(unix_time_buffer));
@@ -61,17 +65,16 @@ pub(crate) async fn rtc_adjust_task(
             }
             Err(e) => {
                 rtc_offset_flag.reset();
-                log::error!("Error in Rtc Offset: {:?}", e);
+                log::error!("[Rtc Offset] Error reading timestamp: {:?}", e);
                 time_socket.close();
                 wifi_enabled_flag.wait_peek().await;
                 while let Err(e) = time_socket.connect(endpoint).await {
-                    log::warn!("Keepalive reconnection failed {e:?}, retrying...");
+                    log::warn!("[Rtc Offset] Reconnection failed {e:?}, retrying...");
                     Timer::after_secs(10).await;
                 }
-                log::info!("Keepalive reconnected!");
+                log::info!("[Rtc Offset] Reconnected!");
                 rtc_offset_flag.flag();
             }
         }
-        Timer::after_secs(1).await;
     }
 }

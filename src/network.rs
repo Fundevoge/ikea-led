@@ -27,15 +27,17 @@ pub(crate) async fn connection(
     mut controller: WifiController<'static>,
     enabled_flag: &'static Flag<NoopRawMutex>,
 ) {
-    log::trace!("start connection task");
-    log::info!("Device capabilities: {:?}", controller.capabilities());
+    log::info!(
+        "[WIFI] Device capabilities: {:?}",
+        controller.capabilities()
+    );
     loop {
         if esp_wifi::wifi::wifi_state() == WifiState::StaConnected {
             // wait until we're no longer connected
             controller.wait_for_event(WifiEvent::StaDisconnected).await;
             enabled_flag.reset();
-            log::warn!("[WIFI] DISCONNECTED");
-            embassy_time::Timer::after(Duration::from_millis(5000)).await
+            log::warn!("[WIFI] Disconnected! Retrying in 5 seconds...");
+            embassy_time::Timer::after(Duration::from_millis(5000)).await;
         }
         if !matches!(controller.is_started(), Ok(true)) {
             let client_config =
@@ -46,19 +48,19 @@ pub(crate) async fn connection(
                     ..Default::default()
                 });
             controller.set_configuration(&client_config).unwrap();
-            log::info!("Starting wifi");
+            log::info!("[WIFI] Starting controller...");
             controller.start().unwrap();
-            log::info!("Wifi started!");
+            log::info!("[WIFI] Controller started!");
         }
-        log::trace!("About to connect...");
+        log::info!("[WIFI] About to connect...");
 
         match controller.connect() {
             Ok(_) => {
-                log::info!("Wifi connected!");
+                log::info!("[WIFI] Controller connected!");
                 enabled_flag.flag();
             }
             Err(e) => {
-                log::error!("Failed to connect to wifi: {e:?}");
+                log::error!("[WIFI] Failed to connect! {e:?}");
                 embassy_time::Timer::after(Duration::from_millis(5000)).await
             }
         }
@@ -71,19 +73,19 @@ pub(crate) async fn start_stream(
     frame_duration_micros: &mut u64,
 ) {
     if let Err(stream_connection_error) = stream_socket.connect(STREAM_ADDR).await {
-        log::warn!("Connection error: {stream_connection_error:?}");
+        log::warn!("[Stream] Connection error: {stream_connection_error:?}");
         *state = crate::State::default();
         return;
     }
 
-    log::info!("Stream Connected!");
+    log::info!("[Stream] Connected!");
     let mut fps_decoder_buf = [0_u8; 4];
     stream_socket
         .read_exact(&mut fps_decoder_buf)
         .await
         .unwrap();
     let fps = byteorder::LE::read_f32(&fps_decoder_buf);
-    log::info!("Playing at {fps:.2}");
+    log::info!("[Stream] Playing at {fps:.2}");
     *frame_duration_micros = (1_000_000.0 / fps).round() as u64;
 }
 
@@ -110,30 +112,32 @@ pub(crate) async fn keep_alive(
     let endpoint = (Ipv4Address::new(192, 168, 178, 30), 3126);
 
     while let Err(e) = keepalive_socket.connect(endpoint).await {
-        log::warn!("Keepalive connection failed {e:?}, retrying...");
+        log::warn!("[Keepalive] Initial connection failed, retrying. {e:?}");
         Timer::after_secs(10).await;
     }
-    log::info!("Keepalive connected!");
+    log::info!("[Keepalive] Initially connected!");
     keepalive_established_flag.flag();
 
     loop {
+        // Yield control immediately
+        Timer::after_secs(1).await;
+        // Wait for message
         match keepalive_socket.write_all(&KEEPALIVE_PACKET).await {
             Ok(()) => {
-                Timer::after_secs(10).await;
+                Timer::after_secs(10 - 1).await;
             }
             Err(e) => {
                 keepalive_established_flag.reset();
-                log::error!("Error in keepalive: {:?}", e);
+                log::error!("[Keepalive] Error writing keepalive: {:?}", e);
                 keepalive_socket.close();
                 wifi_enabled_flag.wait_peek().await;
                 while let Err(e) = keepalive_socket.connect(endpoint).await {
-                    log::warn!("Keepalive reconnection failed {e:?}, retrying...");
+                    log::warn!("[Keepalive] Reconnection failed {e:?}, retrying...");
                     Timer::after_secs(10).await;
                 }
-                log::info!("Keepalive reconnected!");
+                log::info!("[Keepalive] Reconnected!");
                 keepalive_established_flag.flag();
             }
         }
-        Timer::after_secs(1).await;
     }
 }

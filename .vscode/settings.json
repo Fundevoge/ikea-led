@@ -1,5 +1,13 @@
 {
-   "rust-analyzer.check.allTargets": false,
-   "rust-analyzer.check.targets": "xtensa-esp32s3-none-elf",
+    "rust-analyzer.check.allTargets": false,
+    "rust-analyzer.check.targets": "xtensa-esp32s3-none-elf",
+    "spellright.language": [
+        "de",
+        "en"
+    ],
+    "spellright.documentTypes": [
+        "markdown",
+        "latex",
+        "plaintext"
+    ],
 }
-
