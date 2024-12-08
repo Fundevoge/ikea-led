@@ -151,8 +151,8 @@ static mut STREAM_TX_BUFFER: [u8; TX_BUFFER_SIZE_STREAM] = [0; TX_BUFFER_SIZE_ST
 
 const RX_BUFFER_SIZE_CONTROL: usize = 1024;
 const TX_BUFFER_SIZE_CONTROL: usize = 64;
-static mut CONTROL_RX_BUFFER: [u8; RX_BUFFER_SIZE_CONTROL] = [0; RX_BUFFER_SIZE_CONTROL];
-static mut CONTROL_TX_BUFFER: [u8; TX_BUFFER_SIZE_CONTROL] = [0; TX_BUFFER_SIZE_CONTROL];
+static mut STATE_CONTROL_RX_BUFFER: [u8; RX_BUFFER_SIZE_CONTROL] = [0; RX_BUFFER_SIZE_CONTROL];
+static mut STATE_CONTROL_TX_BUFFER: [u8; TX_BUFFER_SIZE_CONTROL] = [0; TX_BUFFER_SIZE_CONTROL];
 
 #[main]
 async fn main(spawner: embassy_executor::Spawner) -> ! {
@@ -215,7 +215,7 @@ async fn main(spawner: embassy_executor::Spawner) -> ! {
 
     esp_hal_embassy::init(timg_embassy.timer0);
 
-    log::info!("Hello world!");
+    log::info!("[MAIN] Hello world!");
 
     let mut screen_override = gpio::Output::new(screen_override_pin, gpio::Level::Low);
 
@@ -284,19 +284,19 @@ async fn main(spawner: embassy_executor::Spawner) -> ! {
         .unwrap();
     rtc_offset_flag.wait_peek().await;
 
-    let mut control_socket = TcpSocket::new(
+    let mut state_control_socket = TcpSocket::new(
         wifi_program_stack,
-        unsafe { &mut *addr_of_mut!(CONTROL_RX_BUFFER) },
-        unsafe { &mut *addr_of_mut!(CONTROL_TX_BUFFER) },
+        unsafe { &mut *addr_of_mut!(STATE_CONTROL_RX_BUFFER) },
+        unsafe { &mut *addr_of_mut!(STATE_CONTROL_TX_BUFFER) },
     );
-    if let Err(control_connection_error) = control_socket
-        .connect((Ipv4Address::new(192, 168, 178, 30), 3124))
-        .await
-    {
-        log::warn!("Connection error: {control_connection_error:?}");
-    } else {
-        log::info!("State Control Connected!");
+
+    let state_control_endpoint = (Ipv4Address::new(192, 168, 178, 30), 3124);
+
+    while let Err(e) = state_control_socket.connect(state_control_endpoint).await {
+        log::warn!("[MAIN] (State Control) Initial connection failed, retrying. {e:?}");
+        Timer::after_secs(10).await;
     }
+    log::info!("[MAIN] (State Control) Initially Connected!");
 
     let mut stream_socket = TcpSocket::new(
         wifi_program_stack,
@@ -329,7 +329,7 @@ async fn main(spawner: embassy_executor::Spawner) -> ! {
     let _guard = cpu_control
         .start_app_core(unsafe { &mut *addr_of_mut!(APP_CORE_STACK) }, cpu1_fnctn)
         .unwrap();
-    log::info!("Started Spi renderer!");
+    log::info!("[MAIN] Started Spi renderer!");
 
     let button_input = gpio::Input::new_typed(button_pin, gpio::Pull::Up);
 
@@ -344,14 +344,17 @@ async fn main(spawner: embassy_executor::Spawner) -> ! {
 
     let mut state_decode_buf = [0_u8; 16];
     let mut frame_duration_micros: u64 = 200_000;
-    log::info!("Entering main loop");
+    log::info!("[MAIN] Entering main loop");
 
     let mut frame = RenderBuffer::empty();
     let mut state = State::default();
 
     loop {
-        if control_socket.can_recv() {
-            let n_bytes = control_socket.read(&mut state_decode_buf).await.unwrap();
+        if state_control_socket.can_recv() {
+            let n_bytes = state_control_socket
+                .read(&mut state_decode_buf)
+                .await
+                .unwrap();
             if n_bytes != 0 && state != State::Stream && state != State::Off {
                 network::start_stream(&mut stream_socket, &mut state, &mut frame_duration_micros)
                     .await;
@@ -372,11 +375,11 @@ async fn main(spawner: embassy_executor::Spawner) -> ! {
             // Move to next State
             match button_signal.wait().await {
                 ButtonPress::Short => {
-                    log::info!("Got short button input!");
+                    log::info!("[MAIN] (Button) Got short button input!");
                     state.next();
                 }
                 ButtonPress::Long => {
-                    log::info!("Got long button input!");
+                    log::info!("[MAIN] (Button) Got long button input!");
                     state.toggle_on_off();
                 }
             }

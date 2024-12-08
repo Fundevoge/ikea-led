@@ -153,7 +153,30 @@ impl log::Log for SdLogger {
 
         let current_time = TzDe.from_utc_datetime(&unsafe { RTC_REF.unwrap() }.current_time());
 
-        println!("{} - {} - {}", record.level(), current_time, record.args());
+        const RESET: &str = "\u{001B}[0m";
+        const RED: &str = "\u{001B}[31m";
+        const GREEN: &str = "\u{001B}[32m";
+        const YELLOW: &str = "\u{001B}[33m";
+        const BLUE: &str = "\u{001B}[34m";
+        const CYAN: &str = "\u{001B}[35m";
+
+        let color = match record.level() {
+            log::Level::Error => RED,
+            log::Level::Warn => YELLOW,
+            log::Level::Info => GREEN,
+            log::Level::Debug => BLUE,
+            log::Level::Trace => CYAN,
+        };
+        let reset = RESET;
+
+        println!(
+            "{}{} - {} - {}{}",
+            color,
+            record.level(),
+            current_time,
+            record.args(),
+            reset
+        );
 
         // Safety: Only used on one core
         let mut volume_mgr = unsafe { SD_LOGGER_VOLUME_MANAGER.as_mut().unwrap() };
