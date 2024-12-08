@@ -150,9 +150,6 @@ impl log::Log for SdLogger {
         if !self.enabled(record.metadata()) {
             return;
         }
-
-        let current_time = TzDe.from_utc_datetime(&unsafe { RTC_REF.unwrap() }.current_time());
-
         const RESET: &str = "\u{001B}[0m";
         const RED: &str = "\u{001B}[31m";
         const GREEN: &str = "\u{001B}[32m";
@@ -168,6 +165,12 @@ impl log::Log for SdLogger {
             log::Level::Trace => CYAN,
         };
         let reset = RESET;
+
+        if unsafe { !crate::panic_reboot::FIRST_REBOOT } {
+            println!("{}{} - {}{}", color, record.level(), record.args(), reset);
+        }
+
+        let current_time = TzDe.from_utc_datetime(&unsafe { RTC_REF.unwrap() }.current_time());
 
         println!(
             "{}{} - {} - {}{}",

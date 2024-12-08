@@ -14,9 +14,10 @@ mod render;
 mod rtc;
 mod sd_logger;
 mod tz_de;
+mod xtensa;
 
 use core::ptr::addr_of_mut;
-use esp_backtrace as _;
+// use esp_backtrace as _;
 use esp_hal::{
     cpu_control::{self, CpuControl},
     dma::Dma,
@@ -289,14 +290,17 @@ async fn main(spawner: embassy_executor::Spawner) -> ! {
         unsafe { &mut *addr_of_mut!(STATE_CONTROL_RX_BUFFER) },
         unsafe { &mut *addr_of_mut!(STATE_CONTROL_TX_BUFFER) },
     );
+    state_control_socket.set_timeout(Some(embassy_time::Duration::from_secs(5)));
 
     let state_control_endpoint = (Ipv4Address::new(192, 168, 178, 30), 3124);
 
+    log::info!("[MAIN] (State Control) Trying to connect...");
     while let Err(e) = state_control_socket.connect(state_control_endpoint).await {
         log::warn!("[MAIN] (State Control) Initial connection failed, retrying. {e:?}");
         Timer::after_secs(10).await;
     }
     log::info!("[MAIN] (State Control) Initially Connected!");
+    state_control_socket.set_timeout(None);
 
     let mut stream_socket = TcpSocket::new(
         wifi_program_stack,

@@ -20,13 +20,13 @@ inherits = "release"
 debug = true
 
 [dependencies]
-esp-backtrace = { version = "0.14.2", features = [
-    "esp32s3",
-    "panic-handler",
-    "exception-handler",
-    "defmt",
-    "custom-halt",
-] } # , path = "C:\\Programmieren\\rust_embedded\\esp32-s3-wroom-1\\dependencies\\esp-backtrace-0.14.2" 
+# esp-backtrace = { version = "0.14.2", features = [
+#     "esp32s3",
+#     "panic-handler",
+#     "exception-handler",
+#     "defmt",
+#     "custom-halt",
+# ] } # , path = "C:\\Programmieren\\rust_embedded\\esp32-s3-wroom-1\\dependencies\\esp-backtrace-0.14.2" 
 
 esp-alloc = "0.5.0"
 esp-hal = { version = "0.22.0", features = [

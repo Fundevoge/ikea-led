@@ -40,18 +40,22 @@ pub(crate) async fn rtc_adjust_task(
         unsafe { &mut *addr_of_mut!(TIME_RX_BUFFER) },
         unsafe { &mut *addr_of_mut!(TIME_TX_BUFFER) },
     );
-    // time_socket.set_timeout(Some(embassy_time::Duration::from_secs(10)));
+    time_socket.set_timeout(Some(embassy_time::Duration::from_secs(5)));
     let endpoint = (Ipv4Address::new(192, 168, 178, 30), 3125);
 
+    log::info!("[Rtc Offset] Trying to connect...");
     while let Err(e) = time_socket.connect(endpoint).await {
         log::warn!("[Rtc Offset] Initial connection failed, retrying. {e:?}");
         Timer::after_secs(10).await;
     }
+    time_socket.set_timeout(Some(embassy_time::Duration::from_secs(50)));
+    log::info!("[Rtc Offset] Initially connected!");
 
     let mut unix_time_buffer = [0_u8; 8];
     time_socket.read_exact(&mut unix_time_buffer).await.unwrap();
+    log::info!("[Rtc Offset] Received first packet!");
     set_rtc_offset(rtc, u64::from_le_bytes(unix_time_buffer));
-    log::info!("[Rtc Offset] Initially connected!");
+    log::info!("[Rtc Offset] Set initial offset!");
     rtc_offset_flag.flag();
 
     loop {

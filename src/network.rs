@@ -32,12 +32,16 @@ pub(crate) async fn connection(
         controller.capabilities()
     );
     loop {
-        if esp_wifi::wifi::wifi_state() == WifiState::StaConnected {
-            // wait until we're no longer connected
-            controller.wait_for_event(WifiEvent::StaDisconnected).await;
-            enabled_flag.reset();
-            log::warn!("[WIFI] Disconnected! Retrying in 5 seconds...");
-            embassy_time::Timer::after(Duration::from_millis(5000)).await;
+        match esp_wifi::wifi::wifi_state() {
+            WifiState::StaConnected => {
+                controller.wait_for_event(WifiEvent::StaDisconnected).await;
+                enabled_flag.reset();
+                log::warn!("[WIFI] Disconnected! Retrying in 5 seconds...");
+                embassy_time::Timer::after(Duration::from_millis(5000)).await;
+            }
+            _ => {
+                log::info!("[WIFI] Current state: {:?}", esp_wifi::wifi::wifi_state());
+            }
         }
         if !matches!(controller.is_started(), Ok(true)) {
             let client_config =
@@ -56,7 +60,9 @@ pub(crate) async fn connection(
 
         match controller.connect() {
             Ok(_) => {
-                log::info!("[WIFI] Controller connected!");
+                log::info!("[WIFI] Controller connect returned successfully.");
+                controller.wait_for_event(WifiEvent::StaConnected).await;
+                log::info!("[WIFI] Controller reached connected state!");
                 enabled_flag.flag();
             }
             Err(e) => {
@@ -108,19 +114,19 @@ pub(crate) async fn keep_alive(
         unsafe { &mut *addr_of_mut!(KEEPALIVE_TX_BUFFER) },
     );
 
-    keepalive_socket.set_timeout(Some(Duration::from_secs(20)));
+    keepalive_socket.set_timeout(Some(Duration::from_secs(5)));
     let endpoint = (Ipv4Address::new(192, 168, 178, 30), 3126);
 
+    log::info!("[Keepalive] Trying to connect...");
     while let Err(e) = keepalive_socket.connect(endpoint).await {
         log::warn!("[Keepalive] Initial connection failed, retrying. {e:?}");
         Timer::after_secs(10).await;
     }
+    keepalive_socket.set_timeout(Some(Duration::from_secs(20)));
     log::info!("[Keepalive] Initially connected!");
     keepalive_established_flag.flag();
 
     loop {
-        // Yield control immediately
-        Timer::after_secs(1).await;
         // Wait for message
         match keepalive_socket.write_all(&KEEPALIVE_PACKET).await {
             Ok(()) => {
