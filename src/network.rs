@@ -114,10 +114,10 @@ pub(crate) async fn keep_alive(
         unsafe { &mut *addr_of_mut!(KEEPALIVE_TX_BUFFER) },
     );
 
-    keepalive_socket.set_timeout(Some(Duration::from_secs(5)));
     let endpoint = (Ipv4Address::new(192, 168, 178, 30), 3126);
 
     log::info!("[Keepalive] Trying to connect...");
+    keepalive_socket.set_timeout(Some(Duration::from_secs(5)));
     while let Err(e) = keepalive_socket.connect(endpoint).await {
         log::warn!("[Keepalive] Initial connection failed, retrying. {e:?}");
         Timer::after_secs(10).await;
@@ -130,17 +130,19 @@ pub(crate) async fn keep_alive(
         // Wait for message
         match keepalive_socket.write_all(&KEEPALIVE_PACKET).await {
             Ok(()) => {
-                Timer::after_secs(10 - 1).await;
+                Timer::after_secs(10).await;
             }
             Err(e) => {
                 keepalive_established_flag.reset();
                 log::error!("[Keepalive] Error writing keepalive: {:?}", e);
                 keepalive_socket.close();
                 wifi_enabled_flag.wait_peek().await;
+                keepalive_socket.set_timeout(Some(Duration::from_secs(5)));
                 while let Err(e) = keepalive_socket.connect(endpoint).await {
                     log::warn!("[Keepalive] Reconnection failed {e:?}, retrying...");
-                    Timer::after_secs(10).await;
+                    Timer::after_secs(5).await;
                 }
+                keepalive_socket.set_timeout(Some(Duration::from_secs(20)));
                 log::info!("[Keepalive] Reconnected!");
                 keepalive_established_flag.flag();
             }

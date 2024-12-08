@@ -40,10 +40,10 @@ pub(crate) async fn rtc_adjust_task(
         unsafe { &mut *addr_of_mut!(TIME_RX_BUFFER) },
         unsafe { &mut *addr_of_mut!(TIME_TX_BUFFER) },
     );
-    time_socket.set_timeout(Some(embassy_time::Duration::from_secs(5)));
     let endpoint = (Ipv4Address::new(192, 168, 178, 30), 3125);
 
     log::info!("[Rtc Offset] Trying to connect...");
+    time_socket.set_timeout(Some(embassy_time::Duration::from_secs(5)));
     while let Err(e) = time_socket.connect(endpoint).await {
         log::warn!("[Rtc Offset] Initial connection failed, retrying. {e:?}");
         Timer::after_secs(10).await;
@@ -72,10 +72,12 @@ pub(crate) async fn rtc_adjust_task(
                 log::error!("[Rtc Offset] Error reading timestamp: {:?}", e);
                 time_socket.close();
                 wifi_enabled_flag.wait_peek().await;
+                time_socket.set_timeout(Some(embassy_time::Duration::from_secs(5)));
                 while let Err(e) = time_socket.connect(endpoint).await {
                     log::warn!("[Rtc Offset] Reconnection failed {e:?}, retrying...");
-                    Timer::after_secs(10).await;
+                    Timer::after_secs(5).await;
                 }
+                time_socket.set_timeout(Some(embassy_time::Duration::from_secs(50)));
                 log::info!("[Rtc Offset] Reconnected!");
                 rtc_offset_flag.flag();
             }
