@@ -1,7 +1,7 @@
 use defmt::unreachable;
 use esp_hal::reset;
 
-static mut REBOOT_IMMINENT: bool = false;
+pub(crate) static mut REBOOT_IMMINENT: bool = false;
 pub(crate) static mut FIRST_REBOOT: bool = true;
 
 fn halt() -> ! {

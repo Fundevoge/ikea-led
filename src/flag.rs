@@ -1,3 +1,4 @@
+#![allow(dead_code)]
 //! A synchronization primitive for passing the latest value to a task.
 use core::cell::Cell;
 use core::future::{poll_fn, Future};
