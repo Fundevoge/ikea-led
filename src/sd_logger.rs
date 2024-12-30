@@ -49,17 +49,14 @@ pub fn init_logger(
     let mut max_file_num: u32 = 0;
     volume_mgr
         .iterate_dir(root_dir, |entry| {
-            if !entry.attributes.is_directory()
+            if entry.attributes.is_directory()
                 || entry.attributes.is_hidden()
                 || entry.attributes.is_read_only()
                 || entry.attributes.is_system()
                 || entry.attributes.is_volume()
-                || !entry
-                    .name
-                    .base_name()
-                    .iter()
-                    .all(|b| b'0' <= *b && *b <= b'9')
+                || !entry.name.base_name().iter().all(u8::is_ascii_digit)
             {
+                println!("INFO - Skipping SD Card entry '{}'", entry.name);
                 return;
             }
 
