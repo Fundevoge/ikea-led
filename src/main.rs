@@ -15,8 +15,7 @@ mod sd_logger;
 mod tz_de;
 mod xtensa;
 
-use byteorder::ByteOrder;
-use chrono::{DateTime, NaiveDateTime, TimeDelta, TimeZone as _};
+use chrono::TimeZone as _;
 use core::ptr::addr_of_mut;
 use tz_de::TzDe;
 // use esp_backtrace as _;
@@ -44,7 +43,7 @@ use embassy_sync::{
 };
 use embassy_time::{Duration, Timer};
 
-use embedded_svc::io::asynch::{Read, Write};
+use embedded_svc::io::asynch::Read;
 
 use heapless::Vec;
 
@@ -123,96 +122,16 @@ impl State {
     const fn frame_duration(&self) -> Option<u64> {
         match self {
             State::Stream => None,
-            State::Clock(_) => Some(300_000),
-            State::Off => Some(1_000_000),
+            State::Clock(_) => Some(10_000),
+            State::Off => Some(10_000),
         }
-    }
-}
-
-#[repr(u8)]
-enum IncomingPacketType {
-    TimeSync,
-    TimeFollowUp,
-    TimeDelayResp,
-    StateChange,
-}
-
-impl TryFrom<u8> for IncomingPacketType {
-    type Error = ();
-
-    fn try_from(value: u8) -> Result<Self, Self::Error> {
-        match value {
-            0 => Ok(Self::TimeSync),
-            1 => Ok(Self::TimeFollowUp),
-            2 => Ok(Self::TimeDelayResp),
-            3 => Ok(Self::StateChange),
-            _ => Err(()),
-        }
-    }
-}
-
-enum OutgoingPacketType {
-    Keepalive,
-    TimeDelayReq,
-}
-
-const PACKET_FILLER: u8 = 0b01010110;
-static mut TCP_PACKET: [u8; 256] = [PACKET_FILLER; 256];
-async fn send_tcp_packet(
-    socket: &mut TcpSocket<'_>,
-    packet: OutgoingPacketType,
-    last_packet_sent: &mut NaiveDateTime,
-    rtc: &Rtc<'_>,
-) -> Option<()> {
-    let packet_id: u8 = match packet {
-        OutgoingPacketType::Keepalive => 0,
-        OutgoingPacketType::TimeDelayReq => 1,
-    };
-    unsafe {
-        TCP_PACKET[0] = packet_id;
-    }
-    if socket.write_all(unsafe { &TCP_PACKET }).await.is_ok() {
-        *last_packet_sent = rtc.current_time();
-        Some(())
-    } else {
-        None
-    }
-}
-
-async fn setup_tcp_socket(socket: &mut TcpSocket<'_>) {
-    socket.set_timeout(Some(embassy_time::Duration::from_secs(5)));
-    let endpoint = (Ipv4Address::new(192, 168, 178, 30), 3124);
-    log::info!("[MAIN] (TCP Socket) Trying to connect...");
-    while let Err(e) = socket.connect(endpoint).await {
-        log::warn!("[MAIN] (TCP Socket) Connection failed, retrying. {e:?}");
-        Timer::after_secs(10).await;
-    }
-    log::info!("[MAIN] (TCP Socket) Connected!");
-    socket.set_timeout(Some(embassy_time::Duration::from_secs(90)));
-    Timer::after_secs(10).await;
-}
-
-async fn reset_tcp_socket(socket: &mut TcpSocket<'_>, wifi_enabled_flag: &Flag<NoopRawMutex>) {
-    socket.abort();
-    wifi_enabled_flag.wait_peek().await;
-    setup_tcp_socket(socket).await;
-}
-
-enum PTPStateMachine {
-    Idle,
-    Sync(NaiveDateTime),
-    DelayReq(NaiveDateTime),
-}
-
-impl PTPStateMachine {
-    fn new() -> Self {
-        Self::Idle
     }
 }
 
 // Inter task communication
 static WIFI_ENABLED_FLAG: StaticCell<Flag<NoopRawMutex>> = StaticCell::new();
 static BUTTON_SIGNAL: StaticCell<Signal<NoopRawMutex, ButtonPress>> = StaticCell::new();
+static STATE_SIGNAL: StaticCell<Signal<NoopRawMutex, State>> = StaticCell::new();
 static mut RENDER_BUF_PTR_USED: Mutex<CriticalSectionRawMutex, *mut RenderBuffer> =
     Mutex::new(addr_of_mut!(RENDER_BUF_1));
 
@@ -257,14 +176,6 @@ async fn button_read_task(
         // Debounce
         Timer::after(Duration::from_millis(400)).await;
     }
-}
-
-fn read_naive_datetime(receive_buffer: &[u8]) -> Option<NaiveDateTime> {
-    DateTime::from_timestamp(
-        byteorder::LE::read_i64(&receive_buffer[0..8]),
-        byteorder::LE::read_u32(&receive_buffer[8..12]),
-    )
-    .map(|dt| DateTime::<chrono::Utc>::naive_utc(&dt))
 }
 
 // Additional memory of main task to reduce stack size
@@ -401,7 +312,7 @@ async fn main(spawner: embassy_executor::Spawner) -> ! {
         unsafe { &mut *addr_of_mut!(WIFI_RX_BUFFER) },
         unsafe { &mut *addr_of_mut!(WIFI_TX_BUFFER) },
     );
-    setup_tcp_socket(&mut tcp_socket).await;
+    network::setup_tcp_socket(&mut tcp_socket).await;
 
     let spi: Spi<'static, esp_hal::Async> = Spi::new_with_config(
         spi_peripheral_display,
@@ -439,6 +350,16 @@ async fn main(spawner: embassy_executor::Spawner) -> ! {
         .spawn(button_read_task(button_input, button_signal))
         .unwrap();
 
+    let state_signal: &'static Signal<NoopRawMutex, State> = &*STATE_SIGNAL.init(Signal::new());
+    spawner
+        .spawn(network::tcp_socket_task(
+            tcp_socket,
+            rtc,
+            wifi_enabled_flag,
+            state_signal,
+        ))
+        .unwrap();
+
     let mut editable_render_buf = unsafe { &mut *addr_of_mut!(RENDER_BUF_2) };
 
     let mut frame_duration_micros: u64 = 200_000;
@@ -446,14 +367,8 @@ async fn main(spawner: embassy_executor::Spawner) -> ! {
 
     let mut frame = RenderBuffer::empty();
     let mut state = State::default();
-    let mut tcp_receive_buffer = [0_u8; 64];
-    let mut ptp_state_machine = PTPStateMachine::new();
-    let mut last_packet_sent = NaiveDateTime::MIN;
-    let mut last_packet_received = NaiveDateTime::MAX;
-
     loop {
         let frame_timer = Timer::after(Duration::from_micros(frame_duration_micros));
-        let mut new_state: Option<State> = None;
 
         // Render frame depending on the state
         match state {
@@ -466,9 +381,7 @@ async fn main(spawner: embassy_executor::Spawner) -> ! {
                     state = State::default();
                     frame_duration_micros = state.frame_duration().unwrap();
 
-                    reset_tcp_socket(&mut tcp_socket, wifi_enabled_flag).await;
-                } else {
-                    last_packet_received = rtc.current_time();
+                    // network::reset_tcp_socket(&mut tcp_socket, wifi_enabled_flag).await;
                 }
             }
             State::Clock(clock_type) => {
@@ -480,96 +393,8 @@ async fn main(spawner: embassy_executor::Spawner) -> ! {
         *editable_render_buf = frame;
         render::render(&mut editable_render_buf).await;
 
-        if tcp_socket.can_recv() {
-            let socket_invalid = 'read_packet: {
-                if let Err(e) = tcp_socket.read_exact(&mut tcp_receive_buffer).await {
-                    log::error!("[MAIN] (TCP Socket) Error receiving full packet! {e}");
-                    break 'read_packet true;
-                };
-
-                let Ok(packet_type) = IncomingPacketType::try_from(tcp_receive_buffer[0]) else {
-                    log::error!("[MAIN] (TCP Socket) Error parsing packet type!");
-                    break 'read_packet true;
-                };
-
-                match packet_type {
-                    IncomingPacketType::StateChange => {
-                        let Ok(new_state_network) = State::try_from(tcp_receive_buffer[1]) else {
-                            log::error!("[MAIN] (TCP Socket) Error parsing state type!");
-                            break 'read_packet true;
-                        };
-                        new_state = Some(new_state_network);
-                    }
-                    IncomingPacketType::TimeSync => {
-                        ptp_state_machine = PTPStateMachine::Sync(rtc.current_time());
-                    }
-                    IncomingPacketType::TimeFollowUp => {
-                        if let PTPStateMachine::Sync(sync_received) = ptp_state_machine {
-                            let Some(sync_sent) = read_naive_datetime(&tcp_receive_buffer[1..13])
-                            else {
-                                log::error!("[MAIN] (TCP Socket) Error reading PTP FollowUp!");
-                                break 'read_packet true;
-                            };
-
-                            rtc.set_current_time(
-                                rtc.current_time()
-                                    .checked_add_signed(sync_sent - sync_received)
-                                    .unwrap(),
-                            );
-
-                            if send_tcp_packet(
-                                &mut tcp_socket,
-                                OutgoingPacketType::TimeDelayReq,
-                                &mut last_packet_sent,
-                                rtc,
-                            )
-                            .await
-                            .is_none()
-                            {
-                                log::error!("[MAIN] (TCP Socket) Error sending PTP DelayReq!");
-                                break 'read_packet true;
-                            };
-
-                            ptp_state_machine = PTPStateMachine::DelayReq(rtc.current_time());
-                        } else {
-                            log::warn!("[MAIN] (TCP Socket) PTP FollowUp received in wrong state!");
-                            ptp_state_machine = PTPStateMachine::new();
-                        }
-                    }
-                    IncomingPacketType::TimeDelayResp => {
-                        if let PTPStateMachine::DelayReq(delay_req_sent_adjusted) =
-                            ptp_state_machine
-                        {
-                            let Some(delay_resp_sent) =
-                                read_naive_datetime(&tcp_receive_buffer[1..13])
-                            else {
-                                log::error!("[MAIN] (TCP Socket) Error reading PTP DelayResp!");
-                                break 'read_packet true;
-                            };
-                            rtc.set_current_time(
-                                rtc.current_time()
-                                    .checked_add_signed(
-                                        (delay_resp_sent - delay_req_sent_adjusted) / 2,
-                                    )
-                                    .unwrap(),
-                            );
-                        } else {
-                            log::warn!(
-                                "[MAIN] (TCP Socket) PTP DelayResp received in wrong state!"
-                            );
-                        }
-                        ptp_state_machine = PTPStateMachine::new();
-                    }
-                }
-
-                last_packet_received = rtc.current_time();
-                false
-            };
-
-            if socket_invalid {
-                reset_tcp_socket(&mut tcp_socket, wifi_enabled_flag).await;
-            }
-        }
+        // Checking for new state from Network or Button
+        let mut new_state: Option<State> = state_signal.try_take();
 
         if button_signal.signaled() {
             match button_signal.wait().await {
@@ -598,11 +423,8 @@ async fn main(spawner: embassy_executor::Spawner) -> ! {
                     }
                 }
 
-                // Move to next State
-                state = new_state;
-
                 // Initialize next State
-                match state {
+                match new_state {
                     State::Stream => {
                         network::start_stream(
                             &mut stream_socket,
@@ -616,27 +438,13 @@ async fn main(spawner: embassy_executor::Spawner) -> ! {
                     }
                     _ => {}
                 }
-                if let Some(frame_duration) = state.frame_duration() {
+                if let Some(frame_duration) = new_state.frame_duration() {
                     frame_duration_micros = frame_duration;
                 }
+
+                // Move to next State
+                state = new_state;
             }
-        }
-
-        if rtc.current_time() - last_packet_sent >= TimeDelta::seconds(10)
-            && send_tcp_packet(
-                &mut tcp_socket,
-                OutgoingPacketType::Keepalive,
-                &mut last_packet_sent,
-                rtc,
-            )
-            .await
-            .is_none()
-        {
-            reset_tcp_socket(&mut tcp_socket, wifi_enabled_flag).await;
-        }
-
-        if rtc.current_time() - last_packet_received >= TimeDelta::seconds(90) {
-            reset_tcp_socket(&mut tcp_socket, wifi_enabled_flag).await;
         }
 
         frame_timer.await;
