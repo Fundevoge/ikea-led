@@ -5,6 +5,7 @@
 #![feature(asm_experimental_arch)]
 #![feature(slice_index_methods)]
 #![feature(ascii_char)]
+#![feature(impl_trait_in_assoc_type)]
 
 mod flag;
 mod network;
@@ -29,11 +30,12 @@ use esp_hal::{
     spi::{master::Spi, SpiMode},
     timer::timg::TimerGroup,
 };
-use esp_hal_embassy::{self, Executor};
 use esp_wifi::{
     wifi::{WifiDevice, WifiStaDevice},
     EspWifiController,
 };
+
+use esp_hal_embassy::{self, Executor};
 
 use embassy_net::{tcp::TcpSocket, Ipv4Address, Ipv4Cidr, StackResources, StaticConfigV4};
 use embassy_sync::{
@@ -139,7 +141,7 @@ static mut RENDER_BUF_PTR_USED: Mutex<CriticalSectionRawMutex, *mut RenderBuffer
 static RTC: StaticCell<Rtc> = StaticCell::new();
 static mut RTC2: Option<&'static Rtc> = None;
 static WIFI_CONTROLLER: StaticCell<EspWifiController<'static>> = StaticCell::new();
-static WIFI_STACK_RESOURCES: StaticCell<StackResources<4>> = StaticCell::new();
+static WIFI_STACK_RESOURCES: StaticCell<StackResources<2>> = StaticCell::new();
 static WIFI_PROGRAM_STACK: StaticCell<embassy_net::Stack<WifiDevice<'static, WifiStaDevice>>> =
     StaticCell::new();
 static mut APP_CORE_STACK: cpu_control::Stack<8192> = cpu_control::Stack::new();
@@ -202,6 +204,8 @@ async fn main(spawner: embassy_executor::Spawner) -> ! {
         config
     });
 
+    esp_alloc::heap_allocator!(72 * 1024);
+
     let dma = Dma::new(peripherals.DMA);
     let mut cpu_control = CpuControl::new(peripherals.CPU_CTRL);
     let rng = Rng::new(peripherals.RNG);
@@ -209,12 +213,12 @@ async fn main(spawner: embassy_executor::Spawner) -> ! {
     let rtc: &'static Rtc = RTC.init(Rtc::new(peripherals.LPWR));
     unsafe { RTC2 = Some(rtc) };
 
-    let wifi = peripherals.WIFI;
-    let radio_clk = peripherals.RADIO_CLK;
+    let wifi: esp_hal::peripherals::WIFI = peripherals.WIFI;
+    let radio_clk: esp_hal::peripherals::RADIO_CLK = peripherals.RADIO_CLK;
     let timg_peripheral_wifi = peripherals.TIMG0;
     let timg_peripheral_embassy = peripherals.TIMG1;
 
-    let screen_override_pin = peripherals.GPIO2;
+    let screen_override_pin: gpio::GpioPin<2> = peripherals.GPIO2;
     let button_pin = peripherals.GPIO1;
 
     let sclk_sd = peripherals.GPIO35;
@@ -246,9 +250,32 @@ async fn main(spawner: embassy_executor::Spawner) -> ! {
     let cs_pin_sd = Output::new(cs_sd, gpio::Level::High);
     sd_logger::init_logger(log::LevelFilter::Info, spi_sd, cs_pin_sd);
 
-    // esp_println::logger::init_logger(log::LevelFilter::Info);
+    let spi_display: Spi<'static, esp_hal::Async> = Spi::new_with_config(
+        spi_peripheral_display,
+        esp_hal::spi::master::Config {
+            frequency: 4.MHz(),
+            mode: SpiMode::Mode0,
+            ..esp_hal::spi::master::Config::default()
+        },
+    )
+    .with_sck(sclk_display)
+    .with_mosi(mosi_display)
+    .with_miso(_miso_display)
+    .with_cs(cs_display)
+    .into_async();
 
-    esp_alloc::heap_allocator!(72 * 1024);
+    let cpu1_fnctn = move || {
+        let executor: &'static mut Executor = &mut *CPU1_EXECUTOR.init(Executor::new());
+        executor.run(|spawner| {
+            spawner
+                .spawn(render::render_loop(spi_display, dma_channel_display))
+                .ok();
+        });
+    };
+    let _guard = cpu_control
+        .start_app_core(unsafe { &mut *addr_of_mut!(APP_CORE_STACK) }, cpu1_fnctn)
+        .unwrap();
+    log::info!("[MAIN] Started Spi renderer!");
 
     let timg_wifi = TimerGroup::new(timg_peripheral_wifi);
     let timg_embassy = TimerGroup::new(timg_peripheral_embassy);
@@ -278,8 +305,8 @@ async fn main(spawner: embassy_executor::Spawner) -> ! {
     });
     let seed = 666722646956068949;
 
-    let wifi_stack_resources: &'static mut StackResources<4> =
-        &mut *WIFI_STACK_RESOURCES.init(StackResources::<4>::new());
+    let wifi_stack_resources: &'static mut StackResources<2> =
+        &mut *WIFI_STACK_RESOURCES.init(StackResources::<2>::new());
 
     let wifi_program_stack: &'static embassy_net::Stack<WifiDevice<'_, WifiStaDevice>> =
         &*WIFI_PROGRAM_STACK.init(embassy_net::Stack::new(
@@ -300,12 +327,6 @@ async fn main(spawner: embassy_executor::Spawner) -> ! {
         .unwrap();
     wifi_enabled_flag.wait_peek().await;
 
-    let mut stream_socket = TcpSocket::new(
-        wifi_program_stack,
-        unsafe { &mut *addr_of_mut!(STREAM_RX_BUFFER) },
-        unsafe { &mut *addr_of_mut!(STREAM_TX_BUFFER) },
-    );
-
     // Setting up the TCP Socket
     let mut tcp_socket = TcpSocket::new(
         wifi_program_stack,
@@ -314,32 +335,11 @@ async fn main(spawner: embassy_executor::Spawner) -> ! {
     );
     network::setup_tcp_socket(&mut tcp_socket).await;
 
-    let spi: Spi<'static, esp_hal::Async> = Spi::new_with_config(
-        spi_peripheral_display,
-        esp_hal::spi::master::Config {
-            frequency: 4.MHz(),
-            mode: SpiMode::Mode0,
-            ..esp_hal::spi::master::Config::default()
-        },
-    )
-    .with_sck(sclk_display)
-    .with_mosi(mosi_display)
-    .with_miso(_miso_display)
-    .with_cs(cs_display)
-    .into_async();
-
-    let cpu1_fnctn = move || {
-        let executor: &'static mut Executor = &mut *CPU1_EXECUTOR.init(Executor::new());
-        executor.run(|spawner| {
-            spawner
-                .spawn(render::render_loop(spi, dma_channel_display))
-                .ok();
-        });
-    };
-    let _guard = cpu_control
-        .start_app_core(unsafe { &mut *addr_of_mut!(APP_CORE_STACK) }, cpu1_fnctn)
-        .unwrap();
-    log::info!("[MAIN] Started Spi renderer!");
+    let mut stream_socket = TcpSocket::new(
+        wifi_program_stack,
+        unsafe { &mut *addr_of_mut!(STREAM_RX_BUFFER) },
+        unsafe { &mut *addr_of_mut!(STREAM_TX_BUFFER) },
+    );
 
     let button_input = gpio::Input::new_typed(button_pin, gpio::Pull::Up);
 

@@ -1,1 +1,4 @@
-/target
+target
+src/t.rs
+src/a.rs
+.vscode/settings.json

@@ -10,4 +10,7 @@
         "latex",
         "plaintext"
     ],
+    "rust-analyzer.diagnostics.disabled": [
+        "unlinked-file"
+    ],
 }
