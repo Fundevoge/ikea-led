@@ -144,6 +144,10 @@ impl log::Log for SdLogger {
 
     #[allow(unused)]
     fn log(&self, record: &log::Record) {
+        if record.args().as_str() == Some("esp_wifi_internal_tx 12294") {
+            panic!("Received esp_wifi_internal_tx 12294");
+        }
+
         if !self.enabled(record.metadata()) {
             return;
         }
