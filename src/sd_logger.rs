@@ -144,7 +144,9 @@ impl log::Log for SdLogger {
 
     #[allow(unused)]
     fn log(&self, record: &log::Record) {
-        if record.args().as_str() == Some("esp_wifi_internal_tx 12294") {
+        let mut formatted = heapless::String::<32>::new();
+        let _ = write!(formatted, "{}", record.args());
+        if formatted.starts_with("esp_wifi_internal_tx 1229") {
             panic!("Received esp_wifi_internal_tx 12294");
         }
 

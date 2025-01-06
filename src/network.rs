@@ -104,6 +104,9 @@ pub(crate) async fn connection(
 
                 // controller.wait_for_event(WifiEvent::StaDisconnected).await;
                 // enabled_flag.reset();
+                if let Err(e) = controller.stop_async().await {
+                    log::error!("[WIFI] Disconnected with an error: {e:?}");
+                }
                 log::warn!("[WIFI] Disconnected! Retrying in 30 seconds...");
                 embassy_time::Timer::after(Duration::from_secs(30)).await;
             }
@@ -121,21 +124,27 @@ pub(crate) async fn connection(
                 });
             controller.set_configuration(&client_config).unwrap();
             log::info!("[WIFI] Starting controller...");
-            controller.start().unwrap();
+            controller.start_async().await.unwrap();
             log::info!("[WIFI] Controller started!");
         }
-        log::info!("[WIFI] About to connect...");
 
-        match controller.connect() {
-            Ok(_) => {
-                log::info!("[WIFI] Controller connect returned successfully.");
-                controller.wait_for_event(WifiEvent::StaConnected).await;
-                log::info!("[WIFI] Controller reached connected state!");
-                enabled_flag.flag();
-            }
-            Err(e) => {
-                log::error!("[WIFI] Failed to connect! {e:?}");
-                embassy_time::Timer::after(Duration::from_millis(5000)).await
+        if !matches!(controller.is_connected(), Ok(true)) {
+            log::info!("[WIFI] Not connected, about to connect...");
+            match controller.connect_async().await {
+                Ok(_) => {
+                    log::info!("[WIFI] Controller connect returned successfully.");
+                    if !matches!(controller.is_connected(), Ok(true)) {
+                        log::info!("[WIFI] Controller connect returned successfully but controller is not connected!");
+                    } else {
+                        // controller.wait_for_event(WifiEvent::StaConnected).await;
+                        log::info!("[WIFI] Controller reached connected state!");
+                        enabled_flag.flag();
+                    }
+                }
+                Err(e) => {
+                    log::error!("[WIFI] Failed to connect! {e:?}");
+                    embassy_time::Timer::after(Duration::from_millis(5000)).await
+                }
             }
         }
     }
