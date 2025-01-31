@@ -111,7 +111,7 @@ where
         poll_fn(move |cx| self.poll_wait_take(cx))
     }
 
-    /// non-blocking method to try and take the flag.
+    // non-blocking method to try and take the flag.
     // pub fn try_take(&self) -> Option<()> {
     //     self.state.lock(|cell| {
     //         let state = cell.replace(State::None);

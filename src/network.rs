@@ -19,9 +19,9 @@ const PASSWORD: &str = "59663346713734943174";
 
 #[embassy_executor::task]
 pub(crate) async fn net_task(
-    stack: &'static embassy_net::Stack<WifiDevice<'static, WifiStaDevice>>,
+    mut runner: embassy_net::Runner<'static, WifiDevice<'static, WifiStaDevice>>,
 ) {
-    stack.run().await
+    runner.run().await
 }
 
 #[embassy_executor::task]

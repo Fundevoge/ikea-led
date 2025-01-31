@@ -29,22 +29,21 @@ debug = true
 #     "custom-halt",
 # ] } # , path = "C:\\Programmieren\\rust_embedded\\esp32-s3-wroom-1\\dependencies\\esp-backtrace-0.14.2" 
 
-# Version bumps require rustc 1.83
-esp-alloc = { version = "0.5.0", features = ["nightly"] }
-esp-hal = { version = "0.22.0", features = [ # git = "https://github.com/esp-rs/esp-hal", branch = "main", features = [ 
+esp-alloc = { version = "0.6.0", features = ["nightly"] }
+esp-hal = { version = "0.23.0", features = [
     "esp32s3",
     "log",
 ], default-features = false }
-esp-hal-embassy = { version = "0.5.0", features = [ # git = "https://github.com/esp-rs/esp-hal", branch = "main", features = [
+esp-hal-embassy = { version = "0.6.0", features = [
     "executors",
     "esp32s3",
 ], default-features = false }
-esp-println = { version = "0.12.0", features = [ # git = "https://github.com/esp-rs/esp-hal", branch = "main", features = [ 
+esp-println = { version = "0.13.0", features = [
     "esp32s3",
     "log",
     "defmt-espflash",
-] } # path = "C:\\Programmieren\\rust_embedded\\esp32-s3-wroom-1\\dependencies\\esp-println-0.12.0",
-esp-wifi = { version = "0.11.0", features = [ #  git = "https://github.com/esp-rs/esp-hal", branch = "main", features = [ 
+] }
+esp-wifi = { version = "0.12.0", features = [
     "esp32s3",
     "log",
     "wifi",
@@ -52,12 +51,10 @@ esp-wifi = { version = "0.11.0", features = [ #  git = "https://github.com/esp-r
 ] }
 
 
-embassy-time = { version = "0.3.2", features = ["generic-queue-8"] }
-embassy-executor = { version = "0.6.3", features = [
-    "nightly",
-] } # 0.7.0 requires esp-hal-embassy > 0.5.0
-embassy-sync = "0.6.1"
-embassy-net = { version = "0.4.0", features = [ # 0.5.0 requires esp-wifi > 0.11.0
+embassy-time = { version = "0.4.0", features = ["generic-queue-8"] }
+embassy-executor = { version = "0.7.0", features = ["nightly"] }
+embassy-sync = "0.6.2"
+embassy-net = { version = "0.6.0", features = [
     "medium-ethernet",
     "medium-ip",
     "proto-ipv4",
@@ -66,10 +63,11 @@ embassy-net = { version = "0.4.0", features = [ # 0.5.0 requires esp-wifi > 0.11
 
 
 embedded-hal-async = "1.0.0"
+embedded-hal = "1.0.0"
 embedded-svc = { version = "0.28.1", features = [
     "nightly",
 ], default-features = false }
-embedded-sdmmc = { version = "0.6.0", features = [
+embedded-sdmmc = { version = "0.8.1", features = [
     "defmt-log",
 ], default-features = false } # maybe 0.8.1 if the correct spi trait is implemented
 
@@ -80,14 +78,15 @@ defmt = "0.3.10"
 heapless = { version = "0.8.0", default-features = false }
 log = "0.4.22"
 micromath = "2.1.0"
-smoltcp = { version = "0.11.0", features = [ # 0.12.0 requires esp-wifi > 0.11.0
+smoltcp = { version = "0.12.0", features = [
     "proto-ipv4",
     "async",
     "defmt",
 ], default-features = false }
 static_cell = { version = "2.1.0", features = ["nightly"] }
-xtensa-lx-rt = { version = "0.17.2", features = [ # git = "https://github.com/esp-rs/esp-hal", branch = "main", features = [
+xtensa-lx-rt = { version = "0.18.0", features = [
     "float-save-restore",
     "esp32s3",
 ], default-features = false }
 enumset = "1.1.5"
+fugit = { version = "0.3.7", features = ["defmt"] }

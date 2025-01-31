@@ -1,9 +1,16 @@
-use core::fmt::{Debug, Write};
+use core::{
+    convert::Infallible,
+    fmt::{Debug, Write},
+};
 
 use crate::{tz_de::TzDe, RTC2 as RTC_REF};
 use chrono::{Datelike, TimeZone as _, Timelike};
 use embedded_sdmmc::{File, SdCard, TimeSource, Timestamp, VolumeManager};
-use esp_hal::{delay::Delay, gpio::Output, spi::master::Spi};
+use esp_hal::{
+    delay::{self, Delay},
+    gpio::Output,
+    spi::master::Spi,
+};
 use esp_println::println;
 use heapless::String;
 struct Clock;
@@ -26,8 +33,71 @@ pub(crate) fn is_enabled(_level: log::Level, _target: &str) -> bool {
     true
 }
 
-type VolumeMgr =
-    VolumeManager<SdCard<Spi<'static, esp_hal::Blocking>, Output<'static>, Delay>, Clock>;
+struct SdSpiDevice {
+    spi: Spi<'static, esp_hal::Blocking>,
+    cs: Output<'static>,
+}
+
+impl SdSpiDevice {
+    fn new(spi: Spi<'static, esp_hal::Blocking>, mut cs: Output<'static>) -> SdSpiDevice {
+        // IMPORTANT, otherwise MCP23S17 might not work
+        cs.set_high();
+
+        SdSpiDevice { spi, cs }
+    }
+}
+
+impl embedded_hal::spi::SpiDevice for SdSpiDevice {
+    fn transaction(
+        &mut self,
+        operations: &mut [embedded_hal::spi::Operation<'_, u8>],
+    ) -> Result<(), Self::Error> {
+        for operation in operations {
+            match operation {
+                embedded_hal::spi::Operation::DelayNs(_) => {}
+                _ => {
+                    self.cs.set_low();
+                }
+            }
+            match operation {
+                embedded_hal::spi::Operation::Read(words) => {
+                    let _ = embedded_hal::spi::SpiBus::read(&mut self.spi, words);
+                }
+                embedded_hal::spi::Operation::Write(words) => {
+                    let _ = embedded_hal::spi::SpiBus::write(&mut self.spi, words);
+                }
+                embedded_hal::spi::Operation::Transfer(read, write) => {
+                    let _ = embedded_hal::spi::SpiBus::transfer(&mut self.spi, read, write);
+                }
+                embedded_hal::spi::Operation::TransferInPlace(words) => {
+                    let _ = embedded_hal::spi::SpiBus::transfer_in_place(&mut self.spi, words);
+                }
+                embedded_hal::spi::Operation::DelayNs(ns) => {
+                    delay::Delay::new().delay_nanos(*ns);
+                }
+            }
+            match operation {
+                embedded_hal::spi::Operation::DelayNs(_) => {}
+                _ => {
+                    self.cs.set_high();
+                }
+            }
+        }
+        Ok(())
+    }
+}
+
+impl embedded_hal::spi::ErrorType for SdSpiDevice {
+    type Error = Infallible;
+}
+
+impl core::fmt::Debug for SdSpiDevice {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        write!(f, "MySpi")
+    }
+}
+
+type VolumeMgr = VolumeManager<SdCard<SdSpiDevice, Delay>, Clock>;
 static mut SD_LOGGER_VOLUME_MANAGER: Option<VolumeMgr> = None;
 static mut LOG_FILE_NAME: String<12> = String::new();
 
@@ -37,18 +107,18 @@ pub fn init_logger(
     spi: Spi<'static, esp_hal::Blocking>,
     cs: Output<'static>,
 ) {
-    let sdcard = SdCard::new(spi, cs, Delay::new());
+    let sdcard = SdCard::new(SdSpiDevice::new(spi, cs), Delay::new());
     let mut volume_mgr = VolumeManager::new(sdcard, Clock);
 
-    let volume0 = volume_mgr
+    let mut volume0 = volume_mgr
         .open_volume(embedded_sdmmc::VolumeIdx(0))
         .my_expect("Failed to open volume 0");
-    let root_dir = volume_mgr
-        .open_root_dir(volume0)
+    let mut root_dir = volume0
+        .open_root_dir()
         .my_expect("Failed to open root directory");
     let mut max_file_num: u32 = 0;
-    volume_mgr
-        .iterate_dir(root_dir, |entry| {
+    root_dir
+        .iterate_dir(|entry| {
             if entry.attributes.is_directory()
                 || entry.attributes.is_hidden()
                 || entry.attributes.is_read_only()
@@ -77,27 +147,20 @@ pub fn init_logger(
     write!(log_file_name, "{}", max_file_num + 1)
         .my_expect("New file name should fit into 12 bytes");
 
-    let log_file = volume_mgr
+    let mut log_file: File<'_, SdCard<SdSpiDevice, Delay>, Clock, 4, 4, 1> = root_dir
         .open_file_in_dir(
-            root_dir,
             log_file_name.as_str(),
             embedded_sdmmc::Mode::ReadWriteCreateOrAppend,
         )
         .my_expect("Failed to open or create log file");
 
-    volume_mgr
-        .write(log_file, b"BEGIN OF LOG\r\n")
+    log_file
+        .write(b"BEGIN OF LOG\r\n")
         .my_expect("Failed to write to log file initially");
 
-    volume_mgr
-        .close_file(log_file)
-        .my_expect("Failed to close file");
-    volume_mgr
-        .close_dir(root_dir)
-        .my_expect("Failed to root directory");
-    volume_mgr
-        .close_volume(volume0)
-        .my_expect("Failed to close volume");
+    log_file.close().my_expect("Failed to close file");
+    root_dir.close().my_expect("Failed to root directory");
+    volume0.close().my_expect("Failed to close volume");
 
     unsafe {
         SD_LOGGER_VOLUME_MANAGER = Some(volume_mgr);
@@ -119,15 +182,20 @@ pub fn init_logger(
 
 // Example SPI wrapper
 pub struct SdFileWriter<'a> {
-    volume_mgr: &'a mut VolumeMgr,
-    log_file: File,
+    log_file: File<'a, SdCard<SdSpiDevice, Delay>, Clock, 4, 4, 1>,
+}
+
+impl<'a> SdFileWriter<'a> {
+    fn destruct(self) -> File<'a, SdCard<SdSpiDevice, Delay>, Clock, 4, 4, 1> {
+        self.log_file
+    }
 }
 
 // Implement the Write trait for the wrapper
-impl<'a> Write for SdFileWriter<'a> {
+impl Write for SdFileWriter<'_> {
     fn write_str(&mut self, s: &str) -> core::fmt::Result {
-        self.volume_mgr
-            .write(self.log_file, s.as_bytes())
+        self.log_file
+            .write(s.as_bytes())
             .map(|_| ())
             .map_err(|_| core::fmt::Error)
     }
@@ -186,41 +254,33 @@ impl log::Log for SdLogger {
 
         // Safety: Only used on one core
         let mut volume_mgr = unsafe { SD_LOGGER_VOLUME_MANAGER.as_mut().unwrap() };
-        let volume0 = volume_mgr
+        let mut volume0 = volume_mgr
             .open_volume(embedded_sdmmc::VolumeIdx(0))
             .my_expect("Failed to open volume 0");
-        let root_dir = volume_mgr
-            .open_root_dir(volume0)
+        let mut root_dir = volume0
+            .open_root_dir()
             .my_expect("Failed to open root directory");
 
-        let log_file = volume_mgr
+        let mut log_file = root_dir
             .open_file_in_dir(
-                root_dir,
                 unsafe { LOG_FILE_NAME.as_str() },
                 embedded_sdmmc::Mode::ReadWriteAppend,
             )
             .my_expect("Failed to open log file");
 
+        let mut sd_writer = SdFileWriter { log_file };
         writeln!(
-            SdFileWriter {
-                volume_mgr,
-                log_file
-            },
+            sd_writer,
             "{} - {} - {}",
             record.level(),
             current_time,
             record.args()
         );
+        let mut log_file = sd_writer.destruct();
 
-        volume_mgr
-            .close_file(log_file)
-            .my_expect("Failed to close file");
-        volume_mgr
-            .close_dir(root_dir)
-            .my_expect("Failed to root directory");
-        volume_mgr
-            .close_volume(volume0)
-            .my_expect("Failed to close volume");
+        log_file.close().my_expect("Failed to close file");
+        root_dir.close().my_expect("Failed to root directory");
+        volume0.close().my_expect("Failed to close volume");
     }
 
     fn flush(&self) {}

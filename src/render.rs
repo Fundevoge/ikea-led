@@ -6,11 +6,7 @@ use core::{
 
 use chrono::{DateTime, Timelike};
 use embassy_time::{Duration, Ticker};
-use esp_hal::{
-    dma::{ChannelCreator, DmaPriority, DmaTxBuf},
-    dma_descriptors,
-    spi::master::Spi,
-};
+use esp_hal::{dma::DmaTxBuf, dma_descriptors, spi::master::SpiDma};
 use micromath::F32Ext;
 
 use crate::{
@@ -226,10 +222,8 @@ impl RenderBuffer {
 const RENDER_LOOP_DURATION_MICROS: u64 = 50;
 #[embassy_executor::task]
 pub(crate) async fn render_loop(
-    spi: Spi<'static, esp_hal::Async>, // , esp_hal::peripherals::SPI2
-    dma_channel: ChannelCreator<0>,
+    mut spi: SpiDma<'static, esp_hal::Blocking>, // , esp_hal::peripherals::SPI2, Channel 0
 ) {
-    let mut spi = spi.with_dma(dma_channel.configure(false, DmaPriority::Priority9));
     let (tx_descriptors, _rx_descriptors) = dma_descriptors!(4096);
     let mut tx_descriptors: &mut [esp_hal::dma::DmaDescriptor] = tx_descriptors;
 
@@ -243,7 +237,7 @@ pub(crate) async fn render_loop(
     loop {
         let buffer_in_transfer = unsafe { &mut *(pixel_bits_buffer_in_transfer as *mut _) };
         let dma_buffer_in_transfer = DmaTxBuf::new(tx_descriptors, buffer_in_transfer).unwrap();
-        let spi_transfer = spi.write(dma_buffer_in_transfer).unwrap();
+        let spi_transfer = spi.write(ROWS * COLS / 8, dma_buffer_in_transfer).unwrap();
 
         let mb = min_brightness;
         let mb_1 = mb + 1;
